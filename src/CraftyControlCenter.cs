@@ -30,7 +30,7 @@ internal static class Program
         bool screenshot = args.Length == 2 && args[0].Equals("--screenshot", StringComparison.OrdinalIgnoreCase);
         if (args.Length != 0 && !selfTest && !screenshot)
         {
-            MessageBox.Show("Unknown command-line option.", "Crafty Control Center", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show("Unknown command-line option.", VersionInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 2;
         }
 
@@ -42,7 +42,7 @@ internal static class Program
         if (!firstInstance)
         {
             if (!selfTest && !screenshot)
-                MessageBox.Show("Minecraft Control Center is already running.", "Crafty Control Center",
+                MessageBox.Show("Minecraft Control Center is already running.", VersionInfo.DisplayName,
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 0;
         }
@@ -62,9 +62,9 @@ internal static class Program
             if (!silentSelfTest)
             {
                 MessageBox.Show(
-                    "Crafty Control Center could not find a valid Crafty installation.\r\n\r\n"
+                    "Minecraft Control Center could not find a valid Crafty installation.\r\n\r\n"
                     + "Restart the app to search again or select the folder containing crafty.exe.",
-                    "Crafty Control Center",
+                    VersionInfo.DisplayName,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -899,7 +899,7 @@ internal sealed class ControlCenterForm : Form
         minecraftClientPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft");
         HardenSensitiveStorage();
 
-        Text = "Crafty Control Center";
+        Text = VersionInfo.DisplayName;
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(680, 610);
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -986,7 +986,7 @@ internal sealed class ControlCenterForm : Form
 
     private void BuildInterface()
     {
-        Controls.Add(NewLabel("Crafty Control Center", new Point(26, 20), new Size(620, 38), 18F, true, CraftyTheme.Heading));
+        Controls.Add(NewLabel(VersionInfo.DisplayName, new Point(26, 20), new Size(620, 38), 18F, true, CraftyTheme.Heading));
         Controls.Add(NewLabel("Start your server, open its connection, and launch Minecraft.", new Point(29, 60), new Size(620, 24), 10F, false, CraftyTheme.Text));
 
         Controls.Add(NewLabel("PROGRAM", new Point(ProgramRowLeft + ProgramColumnLeft, 92), new Size(150, 20), 8F, true, CraftyTheme.MutedText));
@@ -1047,7 +1047,7 @@ internal sealed class ControlCenterForm : Form
         shortcutButton.Location = new Point(606, 470);
         shortcutButton.Size = new Size(44, 44);
         shortcutButton.AccessibleName = "Create Shortcut";
-        shortcutButton.AccessibleDescription = "Choose where to create a Crafty Control Center shortcut.";
+        shortcutButton.AccessibleDescription = "Choose where to create a Minecraft Control Center shortcut.";
         shortcutButton.Click += delegate { ChooseShortcutLocation(); };
         toolTip.SetToolTip(shortcutButton, "Create Shortcut...");
         Controls.Add(shortcutButton);
@@ -1088,7 +1088,7 @@ internal sealed class ControlCenterForm : Form
 
         if (MessageBox.Show(this,
             "The Crafty server folder was changed. Restart the app now?",
-            "Crafty Control Center", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
+            VersionInfo.DisplayName, MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
         {
             statusLabel.Text = "Server folder saved. Restart the app to use it.";
             return;
@@ -1139,11 +1139,11 @@ internal sealed class ControlCenterForm : Form
     {
         using (SaveFileDialog dialog = new SaveFileDialog())
         {
-            dialog.Title = "Create Crafty Control Center Shortcut";
+            dialog.Title = "Create Minecraft Control Center Shortcut";
             dialog.Filter = "Windows shortcut (*.lnk)|*.lnk";
             dialog.DefaultExt = "lnk";
             dialog.AddExtension = true;
-            dialog.FileName = "Crafty Control Center";
+            dialog.FileName = "Minecraft Control Center";
             dialog.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
             dialog.OverwritePrompt = true;
 
@@ -1183,7 +1183,7 @@ internal sealed class ControlCenterForm : Form
             Type shortcutType = shortcut.GetType();
             shortcutType.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath });
             shortcutType.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { root });
-            shortcutType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { "Open Crafty Control Center" });
+            shortcutType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { "Open Minecraft Control Center" });
             shortcutType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath + ",0" });
             shortcutType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, shortcut, null);
             AppConfiguration.RegisterShortcut(shortcutPath);
@@ -3055,7 +3055,7 @@ internal sealed class ControlCenterForm : Form
 
     private void ShowError(string message)
     {
-        MessageBox.Show(this, message, "Crafty Control Center", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        MessageBox.Show(this, message, VersionInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     private sealed class ProcessRecord
