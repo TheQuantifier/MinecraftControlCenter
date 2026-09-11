@@ -9,18 +9,35 @@ can create shortcuts.
 
 - Run `release\MinecraftControlCenter-Setup.exe` for a normal Windows installation.
 - Or extract `release\MinecraftControlCenter.zip` and run `MinecraftControlCenter.exe`.
-- On first launch, select the folder containing `crafty.exe`. A portable copy placed
-  beside `crafty.exe` is detected automatically.
+- On first launch, the app automatically finds `crafty.exe` from a running Crafty
+  process, common server locations, or a bounded search of available fixed, network,
+  and removable drives.
+- The executable's own folder is not treated as a fallback location. If automatic
+  discovery finds nothing, the app reports that no Crafty installation was found.
 
-The server selection is stored in `%LOCALAPPDATA%\MinecraftControlCenter\settings.json`.
-Server files, worlds, logs, credentials, and browser profiles are never packaged.
+Detected locations are stored in the editable file
+`%LOCALAPPDATA%\MinecraftControlCenter\settings.json`. Valid user-edited values take
+priority on the next launch. The supported keys are:
+
+- `serverRoot`
+- `playitPath`
+- `prismLauncherPath`
+- `tLauncherPath`
+
+Crafty, PlayIt, Prism Launcher, and TLauncher are detected from running processes,
+known installation paths, and a bounded search of available fixed, network, and
+removable drives. Server files, worlds, logs, credentials, and browser profiles are
+never packaged.
 
 ## Build
 
-Requirements:
+Build requirements:
 
-- Windows with .NET Framework 4.8
+- Windows with the .NET 8 SDK
 - Inno Setup 6 (installer only)
+
+The published application includes its own .NET runtime; end users do not need to
+install .NET separately.
 
 Build the app and portable/update ZIP:
 
@@ -38,15 +55,35 @@ Outputs are written to `release\`:
 
 - `MinecraftControlCenter.exe`
 - `MinecraftControlCenter.zip`
+- `MinecraftControlCenter.zip.sha256`
 - `MinecraftControlCenter-Setup.exe`
 
 ## Updates
 
 The **Update App** button checks the latest release at
 `TheQuantifier/MinecraftControlCenter`. Publish version tags such as `v1.1.0` and
-attach the generated `MinecraftControlCenter.zip`. The updater downloads the ZIP,
-waits for the running app to exit, replaces the installed files (requesting UAC when
-needed), and restarts the app.
+attach both `MinecraftControlCenter.zip` and `MinecraftControlCenter.zip.sha256`.
+The updater requires the exact assets, verifies SHA-256 and the executable's product
+and version metadata, rejects unexpected archive entries, performs an atomic executable
+replacement with rollback, and restarts the app. Failures restore the prior executable
+and are logged under `%LOCALAPPDATA%\MinecraftControlCenter`.
+
+## Uninstall
+
+Use **Uninstall App** inside the control center, or Windows **Installed apps** for an
+installer-based copy. An installed copy delegates to the registered Windows
+uninstaller. A portable copy removes only the app executable, its portable readme,
+its update remnants, `%LOCALAPPDATA%\MinecraftControlCenter`, and shortcuts recorded
+by the app whose targets still point to that executable. It never removes Crafty,
+PlayIt, launchers, server files, worlds, logs, or Crafty credentials.
+
+## Provider architecture
+
+The current programs are exposed through one internal provider contract: installed,
+running, start, stop, and status. Crafty is the server-manager provider, PlayIt is the
+connection provider, and Prism/TLauncher supply the selected launcher provider. This
+keeps provider-specific mechanics out of the shared interface without introducing a
+plugin system in v1.
 
 Change the version in both `src\VersionInfo.cs` and `src\AssemblyInfo.cs` before a
 release, then run `build_installer.ps1`.

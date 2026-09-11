@@ -21,6 +21,8 @@ using System.Windows.Forms;
 
 internal static class Program
 {
+    private static Mutex singleInstance;
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -35,9 +37,24 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
-        string applicationRoot = AppConfiguration.ResolveCraftyRoot(!selfTest && !screenshot);
+        bool firstInstance;
+        singleInstance = new Mutex(true, @"Local\MinecraftControlCenter.SingleInstance", out firstInstance);
+        if (!firstInstance)
+        {
+            if (!selfTest && !screenshot)
+                MessageBox.Show("Minecraft Control Center is already running.", "Crafty Control Center",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return 0;
+        }
+
+        AppLocations locations = AppConfiguration.ResolveLocations(!selfTest && !screenshot);
+        string applicationRoot = locations.CraftyRoot;
         if (String.IsNullOrWhiteSpace(applicationRoot))
+        {
+            if (!selfTest && !screenshot)
+                AppConfiguration.ShowMissingCraftyRecovery();
             return 1;
+        }
         string requiredCraftyPath = Path.Combine(applicationRoot, "crafty.exe");
         if (!File.Exists(requiredCraftyPath))
         {
@@ -45,8 +62,8 @@ internal static class Program
             if (!silentSelfTest)
             {
                 MessageBox.Show(
-                    "Crafty Control Center must be placed in the same folder as crafty.exe.\r\n\r\n"
-                    + "Move this application beside crafty.exe, then run it again.",
+                    "Crafty Control Center could not find a valid Crafty installation.\r\n\r\n"
+                    + "Restart the app to search again or select the folder containing crafty.exe.",
                     "Crafty Control Center",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -54,7 +71,7 @@ internal static class Program
             return 1;
         }
 
-        using (ControlCenterForm form = new ControlCenterForm(applicationRoot, args.Length == 0))
+        using (ControlCenterForm form = new ControlCenterForm(locations))
         {
             if (selfTest)
                 return form.SelfTest() ? 0 : 1;
@@ -823,18 +840,18 @@ internal sealed class ControlCenterForm : Form
 
     private readonly string root;
     private readonly string craftyPath;
-    private readonly string playitPath = @"C:\Program Files\playit_gg\bin\playit.exe";
+    private readonly string playitPath;
     private readonly string prismPath;
     private readonly string tlauncherPath;
     private readonly string tlauncherConfigPath;
     private readonly string launcherChoicePath;
-    private readonly string shortcutMarkerPath;
     private readonly string prismInstanceChoicePath;
     private readonly string credentialPath;
     private readonly string minecraftClientPath;
     private readonly string serversPath;
     private readonly string browserProfile;
     private readonly Dictionary<string, Button> programButtons = new Dictionary<string, Button>();
+    private readonly Dictionary<string, IProgramProvider> providers = new Dictionary<string, IProgramProvider>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Button> cancelButtons = new Dictionary<string, Button>();
     private readonly Dictionary<string, DateTime> startingUntil = new Dictionary<string, DateTime>();
     private readonly HashSet<string> waitingPrograms = new HashSet<string>();
@@ -843,7 +860,6 @@ internal sealed class ControlCenterForm : Form
     private readonly object waitSync = new object();
     private readonly System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer();
     private readonly ToolTip toolTip = new ToolTip();
-    private readonly bool enableFirstRunActions;
     private readonly List<string> startupWarnings = new List<string>();
     private Dictionary<int, ProcessRecord> cachedProcessTable;
     private DateTime processCacheExpires = DateTime.MinValue;
@@ -860,21 +876,25 @@ internal sealed class ControlCenterForm : Form
     private Button shortcutButton;
     private Button serverFolderButton;
     private Button updateButton;
+    private Button uninstallButton;
     private Label gameServerPrompt;
 
-    internal ControlCenterForm(string applicationRoot, bool enableFirstRunActions)
+    internal ControlCenterForm(AppLocations locations)
     {
-        this.enableFirstRunActions = enableFirstRunActions;
-        root = applicationRoot.TrimEnd(Path.DirectorySeparatorChar);
+        root = locations.CraftyRoot.TrimEnd(Path.DirectorySeparatorChar);
         craftyPath = Path.Combine(root, "crafty.exe");
         serversPath = Path.Combine(root, "servers");
-        browserProfile = Path.Combine(root, "CraftyBrowserProfile");
-        prismPath = FindPrism();
-        tlauncherPath = FindTLauncher();
+        browserProfile = Path.Combine(AppConfiguration.DataDirectory, "BrowserProfile");
+        playitPath = locations.PlayitPath;
+        prismPath = locations.PrismLauncherPath;
+        tlauncherPath = locations.TLauncherPath;
+        if (String.IsNullOrWhiteSpace(playitPath))
+            startupWarnings.Add("PlayIt was not found on this computer.");
+        if (String.IsNullOrWhiteSpace(prismPath) && String.IsNullOrWhiteSpace(tlauncherPath))
+            startupWarnings.Add("No supported Minecraft launcher was found on this computer.");
         tlauncherConfigPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".tlauncher", "tlauncher-2.0.properties");
-        launcherChoicePath = Path.Combine(root, "app", "config", "launcher-choice.txt");
-        shortcutMarkerPath = Path.Combine(root, "app", "config", "desktop-shortcut-created.txt");
-        prismInstanceChoicePath = Path.Combine(root, "app", "config", "prism-instance.txt");
+        launcherChoicePath = Path.Combine(AppConfiguration.DataDirectory, "launcher-choice.txt");
+        prismInstanceChoicePath = Path.Combine(AppConfiguration.DataDirectory, "prism-instance.txt");
         credentialPath = Path.Combine(root, "app", "config", "default-creds.txt");
         minecraftClientPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft");
         HardenSensitiveStorage();
@@ -890,6 +910,7 @@ internal sealed class ControlCenterForm : Form
         DoubleBuffered = true;
 
         BuildInterface();
+        ConfigureProviders();
         RefreshPorts();
         selectedGamePortWasOpen = IsSelectedCraftyGamePortOpen();
         RefreshProgramButtons();
@@ -905,8 +926,6 @@ internal sealed class ControlCenterForm : Form
         Shown += delegate
         {
             statusTimer.Start();
-            if (this.enableFirstRunActions)
-                EnsureDesktopShortcutOnFirstRun();
             if (startupWarnings.Count > 0)
                 statusLabel.Text = startupWarnings[0];
         };
@@ -950,6 +969,8 @@ internal sealed class ControlCenterForm : Form
             && portCombo != null
             && refreshPortsButton != null
             && gameServerPrompt != null
+            && providers.Count == 4
+            && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
             && launcherSelector.Items.Count ==
                 (String.IsNullOrWhiteSpace(prismPath) ? 0 : 1)
                 + (String.IsNullOrWhiteSpace(tlauncherPath) ? 0 : 1);
@@ -1041,11 +1062,19 @@ internal sealed class ControlCenterForm : Form
 
         updateButton = NewButton(CraftyTheme.RaisedSurface, CraftyTheme.Text, CraftyTheme.Outline);
         updateButton.Text = "Update App";
-        updateButton.Location = new Point(500, 527);
-        updateButton.Size = new Size(150, 32);
+        updateButton.Location = new Point(482, 527);
+        updateButton.Size = new Size(168, 32);
         updateButton.Click += delegate { UpdateApplication(); };
         toolTip.SetToolTip(updateButton, "Check GitHub Releases for a newer version");
         Controls.Add(updateButton);
+
+        uninstallButton = NewButton(CraftyTheme.RaisedSurface, CraftyTheme.Text, CraftyTheme.Outline);
+        uninstallButton.Text = "Uninstall App";
+        uninstallButton.Location = new Point(291, 527);
+        uninstallButton.Size = new Size(168, 32);
+        uninstallButton.Click += delegate { UninstallApplication(); };
+        toolTip.SetToolTip(uninstallButton, "Remove Minecraft Control Center and its local data");
+        Controls.Add(uninstallButton);
 
         statusLabel = NewLabel("Ready", new Point(30, 574), new Size(620, 24), 10F, false, CraftyTheme.MutedText);
         Controls.Add(statusLabel);
@@ -1091,22 +1120,18 @@ internal sealed class ControlCenterForm : Form
         }
     }
 
-    private void EnsureDesktopShortcutOnFirstRun()
+    private void UninstallApplication()
     {
-        if (File.Exists(shortcutMarkerPath) || !File.Exists(craftyPath))
-            return;
-
+        uninstallButton.Enabled = false;
         try
         {
-            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-            string shortcutPath = Path.Combine(desktop, "Crafty Control Center.lnk");
-            CreateShortcutFile(shortcutPath);
-            MarkShortcutSetupComplete();
-            statusLabel.Text = "Desktop shortcut created.";
+            Uninstaller.Uninstall(this, delegate(string message) { statusLabel.Text = message; statusLabel.Refresh(); });
         }
         catch (Exception ex)
         {
-            statusLabel.Text = "Desktop shortcut could not be created: " + ex.Message;
+            statusLabel.Text = "Uninstall failed.";
+            ShowError("The app could not start its uninstaller.\r\n\r\n" + ex.Message);
+            uninstallButton.Enabled = true;
         }
     }
 
@@ -1128,7 +1153,6 @@ internal sealed class ControlCenterForm : Form
             try
             {
                 CreateShortcutFile(dialog.FileName);
-                MarkShortcutSetupComplete();
                 statusLabel.Text = "Shortcut created: " + Path.GetFileNameWithoutExtension(dialog.FileName) + ".";
             }
             catch (Exception ex)
@@ -1136,12 +1160,6 @@ internal sealed class ControlCenterForm : Form
                 ShowError("Could not create the shortcut.\r\n\r\n" + ex.Message);
             }
         }
-    }
-
-    private void MarkShortcutSetupComplete()
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(shortcutMarkerPath));
-        AtomicWriteAllText(shortcutMarkerPath, "created", false);
     }
 
     private void CreateShortcutFile(string shortcutPath)
@@ -1168,6 +1186,7 @@ internal sealed class ControlCenterForm : Form
             shortcutType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { "Open Crafty Control Center" });
             shortcutType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath + ",0" });
             shortcutType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, shortcut, null);
+            AppConfiguration.RegisterShortcut(shortcutPath);
         }
         finally
         {
@@ -1332,16 +1351,38 @@ internal sealed class ControlCenterForm : Form
 
     private void ToggleProgram(string program)
     {
-        if (IsProgramRunning(program))
-            StopProgram(program);
-        else if (program == CraftyKey)
-            StartCrafty();
-        else if (program == PlayitKey)
-            StartPlayit();
-        else if (program == LauncherKey)
-            StartLauncher();
+        IProgramProvider provider;
+        if (!providers.TryGetValue(program, out provider) || !provider.IsInstalled)
+            return;
+        if (provider.IsRunning)
+            provider.Stop();
         else
-            StartGame();
+            provider.Start();
+    }
+
+    private void ConfigureProviders()
+    {
+        providers[CraftyKey] = NewProvider(CraftyKey, "Crafty", delegate { return File.Exists(craftyPath); }, StartCrafty);
+        providers[PlayitKey] = NewProvider(PlayitKey, "PlayIt", delegate { return File.Exists(playitPath); }, StartPlayit);
+        providers[LauncherKey] = NewProvider(LauncherKey, "Launcher", delegate { return HasSelectedLauncher && File.Exists(SelectedLauncherPath); }, StartLauncher);
+        providers[GameKey] = NewProvider(GameKey, "Minecraft", delegate { return HasSelectedLauncher && File.Exists(SelectedLauncherPath); }, StartGame);
+    }
+
+    private IProgramProvider NewProvider(string key, string displayName, Func<bool> installed, Action start)
+    {
+        return new ProgramProvider(key, delegate { return displayName; }, installed,
+            delegate { return IsProgramRunningCore(key); }, delegate { return GetProviderStatus(key, installed()); },
+            start, delegate { StopProgram(key); });
+    }
+
+    private ProviderStatus GetProviderStatus(string key, bool installed)
+    {
+        if (!installed) return ProviderStatus.Unavailable;
+        if (cancellingPrograms.Contains(key)) return ProviderStatus.Stopping;
+        if (IsProgramRunningCore(key)) return ProviderStatus.Running;
+        if (IsProgramWaiting(key)) return ProviderStatus.Waiting;
+        if (IsProgramStarting(key)) return ProviderStatus.Starting;
+        return ProviderStatus.Stopped;
     }
 
     private void MarkStarting(string program)
@@ -1354,15 +1395,15 @@ internal sealed class ControlCenterForm : Form
 
     private void StartAll()
     {
-        if (!IsProgramRunning(CraftyKey) && !IsProgramStarting(CraftyKey))
-            StartCrafty();
-        if (!IsProgramRunning(PlayitKey) && !IsProgramStarting(PlayitKey))
-            StartPlayit();
-        if (HasSelectedLauncher && !IsProgramRunning(LauncherKey) && !IsProgramStarting(LauncherKey))
-            StartLauncher();
-        if (HasSelectedLauncher && IsSelectedCraftyGamePortOpen()
-            && !IsProgramRunning(GameKey) && !IsProgramStarting(GameKey) && !IsProgramWaiting(GameKey))
-            StartGame();
+        foreach (string key in new[] { CraftyKey, PlayitKey, LauncherKey })
+        {
+            IProgramProvider provider = providers[key];
+            if (provider.IsInstalled && provider.Status == ProviderStatus.Stopped)
+                provider.Start();
+        }
+        IProgramProvider game = providers[GameKey];
+        if (game.IsInstalled && IsSelectedCraftyGamePortOpen() && game.Status == ProviderStatus.Stopped)
+            game.Start();
 
         RefreshBatchButtons();
     }
@@ -2227,7 +2268,7 @@ internal sealed class ControlCenterForm : Form
         security.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
         security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
         security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
-        File.SetAccessControl(path, security);
+        new FileInfo(path).SetAccessControl(security);
     }
 
     private static void HardenDirectory(string path)
@@ -2239,7 +2280,7 @@ internal sealed class ControlCenterForm : Form
         security.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
         security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
         security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
-        Directory.SetAccessControl(path, security);
+        new DirectoryInfo(path).SetAccessControl(security);
     }
 
     private bool TryGetSelectedEndpoint(out GameEndpoint endpoint)
@@ -2421,6 +2462,12 @@ internal sealed class ControlCenterForm : Form
 
     private bool IsProgramRunning(string program)
     {
+        IProgramProvider provider;
+        return providers.TryGetValue(program, out provider) ? provider.IsRunning : IsProgramRunningCore(program);
+    }
+
+    private bool IsProgramRunningCore(string program)
+    {
         if (program == GameKey)
             return IsGameRunning();
         if (program == LauncherKey)
@@ -2468,9 +2515,10 @@ internal sealed class ControlCenterForm : Form
     private void RefreshProgramButtons()
     {
         bool selectedGamePortOpen = IsSelectedCraftyGamePortOpen();
-        foreach (string program in new[] { CraftyKey, PlayitKey, LauncherKey, GameKey })
+        foreach (IProgramProvider provider in providers.Values)
         {
-            if ((program == LauncherKey || program == GameKey) && !HasSelectedLauncher)
+            string program = provider.Key;
+            if (!provider.IsInstalled)
             {
                 startingUntil.Remove(program);
                 CancelWait(program);
@@ -2485,21 +2533,17 @@ internal sealed class ControlCenterForm : Form
             {
                 ShowGameServerPrompt();
             }
-            else if (cancellingPrograms.Contains(program))
-            {
-                // Keep the main control in its Waiting state without resetting the
-                // adjacent Cancel button while its short cancellation settles.
-                SetButtonState(programButtons[program], "Waiting");
-            }
-            else if (IsProgramRunning(program))
+            else if (provider.Status == ProviderStatus.Stopping)
+                SetButtonState(programButtons[program], "Stopping");
+            else if (provider.Status == ProviderStatus.Running)
             {
                 startingUntil.Remove(program);
                 CancelWait(program);
                 SetProgramState(program, "Running");
             }
-            else if (IsProgramWaiting(program))
+            else if (provider.Status == ProviderStatus.Waiting)
                 SetProgramState(program, "Waiting");
-            else if (startingUntil.ContainsKey(program) && DateTime.Now < startingUntil[program])
+            else if (provider.Status == ProviderStatus.Starting)
                 SetProgramState(program, "Starting");
             else
             {
@@ -2992,34 +3036,6 @@ internal sealed class ControlCenterForm : Form
         if (IsProgramRunning(LauncherKey)) running.Add(SelectedLauncher);
         if (IsProgramRunning(GameKey)) running.Add("Game");
         return running.Count == 0 ? "Ready" : "Running: " + String.Join(", ", running.ToArray());
-    }
-
-    private static string FindPrism()
-    {
-        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string[] candidates =
-        {
-            Path.Combine(local, "Programs", "PrismLauncher", "prismlauncher.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PrismLauncher", "prismlauncher.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "PrismLauncher", "prismlauncher.exe")
-        };
-        return candidates.FirstOrDefault(File.Exists) ?? String.Empty;
-    }
-
-    private static string FindTLauncher()
-    {
-        string roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string[] candidates =
-        {
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "TLauncher.exe"),
-            Path.Combine(roaming, ".minecraft", "TLauncher.exe"),
-            Path.Combine(roaming, ".minecraft", "TLauncher32bit.exe"),
-            Path.Combine(local, "Programs", "TLauncher", "TLauncher.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "TLauncher", "TLauncher.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "TLauncher", "TLauncher.exe")
-        };
-        return candidates.FirstOrDefault(File.Exists) ?? String.Empty;
     }
 
     private static string FindBrowser()

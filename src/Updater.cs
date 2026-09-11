@@ -1,181 +1,198 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
+using System.IO.Compression;
+using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 internal static class Updater
 {
+    private static readonly HttpClient Http = CreateHttpClient();
+
     internal static void CheckAndInstall(IWin32Window owner, Action<string> setStatus)
     {
         setStatus("Checking for updates...");
-        ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
         ReleaseInfo release = FetchLatestRelease();
-        if (String.IsNullOrWhiteSpace(release.Version))
-            throw new InvalidDataException("GitHub did not return a release version.");
-
+        if (String.IsNullOrWhiteSpace(release.Version)) throw new InvalidDataException("GitHub did not return a release version.");
         if (!IsNewer(release.Version, VersionInfo.Version))
         {
             setStatus("App is up to date.");
-            MessageBox.Show(owner,
-                "You're up to date.\r\nCurrent: " + VersionInfo.Version + "\r\nLatest: " + release.Version,
+            MessageBox.Show(owner, "You're up to date.\r\nCurrent: " + VersionInfo.Version + "\r\nLatest: " + release.Version,
                 VersionInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        if (String.IsNullOrWhiteSpace(release.ZipUrl) || String.IsNullOrWhiteSpace(release.ChecksumUrl))
+            throw new InvalidDataException("The release must contain MinecraftControlCenter.zip and MinecraftControlCenter.zip.sha256.");
 
-        if (String.IsNullOrWhiteSpace(release.ZipUrl))
+        if (MessageBox.Show(owner, "Update from " + VersionInfo.Version + " to " + release.Version + " now?\r\n\r\n"
+            + "The package will be verified before installation.", "Update available",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+        { setStatus("Update canceled."); return; }
+
+        string updateRoot = Path.Combine(AppConfiguration.DataDirectory, "Updates", Guid.NewGuid().ToString("N"));
+        string zipPath = Path.Combine(updateRoot, VersionInfo.AppName + ".zip");
+        string checksumPath = zipPath + ".sha256";
+        string stagePath = Path.Combine(updateRoot, "staged");
+        Directory.CreateDirectory(stagePath);
+        try
         {
-            setStatus("Update available on GitHub.");
-            MessageBox.Show(owner, "Version " + release.Version
-                + " is available, but the release has no MinecraftControlCenter.zip asset. The release page will open.",
-                VersionInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
-            Process.Start(new ProcessStartInfo(release.HtmlUrl) { UseShellExecute = true });
-            return;
-        }
+            setStatus("Downloading update " + release.Version + "...");
+            Download(release.ZipUrl, zipPath);
+            Download(release.ChecksumUrl, checksumPath);
+            setStatus("Verifying update...");
+            VerifyChecksum(zipPath, checksumPath);
+            ExtractAndValidate(zipPath, stagePath, release.Version);
 
-        if (MessageBox.Show(owner,
-            "Update from " + VersionInfo.Version + " to " + release.Version + " now?\r\n\r\n"
-            + "The app will close, replace its files, and restart.",
-            "Update available", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            string installDirectory = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            bool elevation = !CanWriteTo(installDirectory);
+            string scriptPath = Path.Combine(updateRoot, "apply_update.ps1");
+            File.WriteAllText(scriptPath, BuildUpdateScript(stagePath, installDirectory, updateRoot), new UTF8Encoding(true));
+            ProcessStartInfo start = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + scriptPath + "\"")
+            { UseShellExecute = elevation, CreateNoWindow = !elevation };
+            if (elevation) start.Verb = "runas";
+            Process.Start(start);
+            setStatus("Verified updater started. Closing app...");
+            Application.Exit();
+        }
+        catch
         {
-            setStatus("Update canceled.");
-            return;
+            try { Directory.Delete(updateRoot, true); } catch { }
+            throw;
         }
+    }
 
-        string appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), VersionInfo.AppName);
-        Directory.CreateDirectory(appData);
-        string zipPath = Path.Combine(appData, VersionInfo.AppName + "-" + release.Version + ".zip");
-        setStatus("Downloading update " + release.Version + "...");
-        using (WebClient client = new WebClient())
-        {
-            client.Headers[HttpRequestHeader.UserAgent] = VersionInfo.AppName + "/" + VersionInfo.Version;
-            client.DownloadFile(release.ZipUrl, zipPath);
-        }
-
-        string installDirectory = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
-        bool requiresElevation = !CanWriteTo(installDirectory);
-        string scriptPath = Path.Combine(appData, "run_update.ps1");
-        File.WriteAllText(scriptPath, BuildUpdateScript(zipPath, installDirectory), new UTF8Encoding(true));
-
-        ProcessStartInfo start = new ProcessStartInfo("powershell.exe",
-            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + scriptPath + "\"");
-        start.UseShellExecute = requiresElevation;
-        if (requiresElevation)
-            start.Verb = "runas";
-        else
-            start.CreateNoWindow = true;
-        Process.Start(start);
-
-        setStatus("Updater started. Closing app...");
-        Application.Exit();
+    private static HttpClient CreateHttpClient()
+    {
+        HttpClient client = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(VersionInfo.AppName + "/" + VersionInfo.Version);
+        client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        return client;
     }
 
     private static ReleaseInfo FetchLatestRelease()
     {
-        string json;
-        using (WebClient client = new WebClient())
+        string json = Http.GetStringAsync(VersionInfo.ReleaseApiUrl).GetAwaiter().GetResult();
+        using (JsonDocument document = JsonDocument.Parse(json))
         {
-            client.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json";
-            client.Headers[HttpRequestHeader.UserAgent] = VersionInfo.AppName + "/" + VersionInfo.Version;
-            json = client.DownloadString(VersionInfo.ReleaseApiUrl);
-        }
-
-        Dictionary<string, object> payload = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
-        string tag = ReadString(payload, "tag_name").TrimStart('v', 'V');
-        string htmlUrl = ReadString(payload, "html_url");
-        string zipUrl = String.Empty;
-        object assetsValue;
-        if (payload.TryGetValue("assets", out assetsValue))
-        {
-            IEnumerable assets = assetsValue as IEnumerable;
-            if (assets != null)
+            JsonElement root = document.RootElement;
+            ReleaseInfo info = new ReleaseInfo
             {
-                foreach (object item in assets)
+                Version = ReadString(root, "tag_name").TrimStart('v', 'V'),
+                HtmlUrl = ReadString(root, "html_url")
+            };
+            if (root.TryGetProperty("assets", out JsonElement assets))
+            {
+                foreach (JsonElement asset in assets.EnumerateArray())
                 {
-                    Dictionary<string, object> asset = item as Dictionary<string, object>;
-                    if (asset == null)
-                        continue;
                     string name = ReadString(asset, "name");
-                    if (name.Equals(VersionInfo.AppName + ".zip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        zipUrl = ReadString(asset, "browser_download_url");
-                        break;
-                    }
-                    if (String.IsNullOrWhiteSpace(zipUrl) && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-                        zipUrl = ReadString(asset, "browser_download_url");
+                    string url = ReadString(asset, "browser_download_url");
+                    if (name.Equals(VersionInfo.AppName + ".zip", StringComparison.OrdinalIgnoreCase)) info.ZipUrl = url;
+                    else if (name.Equals(VersionInfo.AppName + ".zip.sha256", StringComparison.OrdinalIgnoreCase)) info.ChecksumUrl = url;
                 }
             }
+            if (String.IsNullOrWhiteSpace(info.HtmlUrl)) info.HtmlUrl = VersionInfo.ReleasesPageUrl;
+            return info;
         }
-        return new ReleaseInfo { Version = tag, ZipUrl = zipUrl,
-            HtmlUrl = String.IsNullOrWhiteSpace(htmlUrl) ? VersionInfo.ReleasesPageUrl : htmlUrl };
     }
 
-    private static string ReadString(Dictionary<string, object> values, string key)
+    private static string ReadString(JsonElement element, string name)
     {
-        object value;
-        return values != null && values.TryGetValue(key, out value) ? Convert.ToString(value) ?? String.Empty : String.Empty;
+        return element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? String.Empty : String.Empty;
+    }
+
+    private static void Download(string url, string destination)
+    {
+        byte[] bytes = Http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+        File.WriteAllBytes(destination, bytes);
+    }
+
+    private static void VerifyChecksum(string zipPath, string checksumPath)
+    {
+        Match expectedMatch = Regex.Match(File.ReadAllText(checksumPath), @"(?i)\b[0-9a-f]{64}\b");
+        if (!expectedMatch.Success) throw new InvalidDataException("The release checksum file is invalid.");
+        string actual;
+        using (SHA256 sha = SHA256.Create())
+        using (FileStream stream = File.OpenRead(zipPath)) actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
+        if (!actual.Equals(expectedMatch.Value, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
+    }
+
+    private static void ExtractAndValidate(string zipPath, string stagePath, string expectedVersion)
+    {
+        HashSet<string> allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { VersionInfo.AppName + ".exe", "PORTABLE_README.txt" };
+        using (ZipArchive archive = ZipFile.OpenRead(zipPath))
+        {
+            foreach (ZipArchiveEntry entry in archive.Entries)
+            {
+                if (!allowed.Contains(entry.FullName) || !entry.FullName.Equals(Path.GetFileName(entry.FullName), StringComparison.Ordinal))
+                    throw new InvalidDataException("The update contains an unexpected file: " + entry.FullName);
+                string destination = Path.Combine(stagePath, entry.FullName);
+                entry.ExtractToFile(destination, true);
+            }
+        }
+        string executable = Path.Combine(stagePath, VersionInfo.AppName + ".exe");
+        if (!File.Exists(executable)) throw new InvalidDataException("The update does not contain the application executable.");
+        FileVersionInfo version = FileVersionInfo.GetVersionInfo(executable);
+        if (!(version.ProductName ?? String.Empty).Equals("Minecraft Control Center", StringComparison.OrdinalIgnoreCase)
+            || !NormalizeVersion(version.FileVersion).Equals(NormalizeVersion(expectedVersion), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The update executable identity or version does not match the release tag.");
+    }
+
+    private static string NormalizeVersion(string value)
+    {
+        Version parsed;
+        return Version.TryParse(value, out parsed) ? new Version(parsed.Major, parsed.Minor, Math.Max(0, parsed.Build)).ToString() : value ?? String.Empty;
     }
 
     private static bool IsNewer(string latest, string current)
     {
-        int[] left = ParseVersion(latest);
-        int[] right = ParseVersion(current);
-        int length = Math.Max(left.Length, right.Length);
-        for (int index = 0; index < length; index++)
-        {
-            int l = index < left.Length ? left[index] : 0;
-            int r = index < right.Length ? right[index] : 0;
-            if (l != r)
-                return l > r;
-        }
-        return false;
-    }
-
-    private static int[] ParseVersion(string value)
-    {
-        MatchCollection matches = Regex.Matches(value ?? String.Empty, @"\d+");
-        int[] result = new int[Math.Max(1, matches.Count)];
-        for (int index = 0; index < matches.Count; index++)
-            Int32.TryParse(matches[index].Value, out result[index]);
-        return result;
+        Version left, right;
+        return Version.TryParse(NormalizeVersion(latest), out left) && Version.TryParse(NormalizeVersion(current), out right) && left > right;
     }
 
     private static bool CanWriteTo(string directory)
     {
-        string path = Path.Combine(directory, ".mcc-update-test-" + Guid.NewGuid().ToString("N") + ".tmp");
-        try { File.WriteAllText(path, "ok"); File.Delete(path); return true; }
-        catch { try { if (File.Exists(path)) File.Delete(path); } catch { } return false; }
+        string test = Path.Combine(directory, ".mcc-write-test-" + Guid.NewGuid().ToString("N"));
+        try { File.WriteAllText(test, "ok"); File.Delete(test); return true; }
+        catch { try { File.Delete(test); } catch { } return false; }
     }
 
-    private static string BuildUpdateScript(string zipPath, string installDirectory)
+    private static string BuildUpdateScript(string stagePath, string installDirectory, string updateRoot)
     {
-        string exePath = Path.Combine(installDirectory, VersionInfo.AppName + ".exe");
-        return "$ErrorActionPreference = 'Stop'\r\n"
-            + "$pidToWait = " + Process.GetCurrentProcess().Id + "\r\n"
-            + "$zipPath = '" + PsQuote(zipPath) + "'\r\n"
-            + "$installDir = '" + PsQuote(installDirectory) + "'\r\n"
-            + "$exePath = '" + PsQuote(exePath) + "'\r\n"
-            + "$tempDir = Join-Path ([IO.Path]::GetTempPath()) ('MinecraftControlCenterUpdate_' + [Guid]::NewGuid())\r\n"
-            + "for ($i = 0; $i -lt 240; $i++) { if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 500 }\r\n"
-            + "New-Item -Path $tempDir -ItemType Directory -Force | Out-Null\r\n"
-            + "Expand-Archive -LiteralPath $zipPath -DestinationPath $tempDir -Force\r\n"
-            + "Copy-Item -Path (Join-Path $tempDir '*') -Destination $installDir -Recurse -Force\r\n"
-            + "Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue\r\n"
-            + "Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue\r\n"
-            + "Start-Process -FilePath $exePath\r\n";
+        string exe = Path.Combine(installDirectory, VersionInfo.AppName + ".exe");
+        string stagedExe = Path.Combine(stagePath, VersionInfo.AppName + ".exe");
+        string readme = Path.Combine(stagePath, "PORTABLE_README.txt");
+        string log = Path.Combine(AppConfiguration.DataDirectory, "update-error.log");
+        return "$ErrorActionPreference='Stop'\r\n$pidToWait=" + Process.GetCurrentProcess().Id + "\r\n"
+            + "$exe='" + Q(exe) + "'\r\n$staged='" + Q(stagedExe) + "'\r\n$readme='" + Q(readme) + "'\r\n"
+            + "$backup=$exe+'.rollback'\r\n$new=$exe+'.new'\r\n$log='" + Q(log) + "'\r\n"
+            + "for($i=0;$i -lt 240;$i++){if(-not(Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}\r\n"
+            + "try {\r\n Remove-Item -LiteralPath $new,$backup -Force -ErrorAction SilentlyContinue\r\n"
+            + " Copy-Item -LiteralPath $staged -Destination $new -Force\r\n [IO.File]::Replace($new,$exe,$backup,$true)\r\n"
+            + " if(Test-Path -LiteralPath $readme){Copy-Item -LiteralPath $readme -Destination (Join-Path '" + Q(installDirectory) + "' 'README.txt') -Force}\r\n"
+            + " Start-Process -FilePath $exe\r\n Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\r\n"
+            + " Remove-Item -LiteralPath '" + Q(updateRoot) + "' -Recurse -Force -ErrorAction SilentlyContinue\r\n"
+            + "} catch {\r\n if(Test-Path -LiteralPath $backup){Copy-Item -LiteralPath $backup -Destination $exe -Force}\r\n"
+            + " $_ | Out-String | Set-Content -LiteralPath $log\r\n Add-Type -AssemblyName PresentationFramework\r\n"
+            + " [System.Windows.MessageBox]::Show('The update failed and the previous version was restored. See '+$log,'Minecraft Control Center')|Out-Null\r\n"
+            + " if(Test-Path -LiteralPath $exe){Start-Process -FilePath $exe}\r\n}\r\n";
     }
 
-    private static string PsQuote(string value) { return value.Replace("'", "''"); }
+    private static string Q(string value) { return value.Replace("'", "''"); }
 
     private sealed class ReleaseInfo
     {
         internal string Version = String.Empty;
         internal string ZipUrl = String.Empty;
+        internal string ChecksumUrl = String.Empty;
         internal string HtmlUrl = String.Empty;
     }
 }

@@ -29,3 +29,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Installer: release\MinecraftControlCenter-Setup.exe" -ForegroundColor Green
 Write-Host "ZIP: release\MinecraftControlCenter.zip" -ForegroundColor Green
+Write-Host "Checksum: release\MinecraftControlCenter.zip.sha256" -ForegroundColor Green
