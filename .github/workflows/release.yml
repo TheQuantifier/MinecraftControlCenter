@@ -1,0 +1,131 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Verify tag, version, and release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $versionSource = Get-Content -Raw 'src/VersionInfo.cs'
+          $versionMatch = [regex]::Match($versionSource, 'Version\s*=\s*"([^"]+)"')
+          if (-not $versionMatch.Success) {
+            throw 'Could not determine the version from src/VersionInfo.cs.'
+          }
+
+          $expectedTag = 'v' + $versionMatch.Groups[1].Value
+          if ($env:RELEASE_TAG -ne $expectedTag) {
+            throw "Tag $env:RELEASE_TAG does not match app version $expectedTag."
+          }
+
+          $notesPath = "release-notes/$env:RELEASE_TAG.md"
+          if (-not (Test-Path -LiteralPath $notesPath)) {
+            throw "Missing release notes: $notesPath"
+          }
+
+      - name: Install Inno Setup when needed
+        shell: pwsh
+        run: |
+          $innoPaths = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+          if (-not ($innoPaths | Where-Object { Test-Path -LiteralPath $_ })) {
+            choco install innosetup --no-progress --yes
+            if ($LASTEXITCODE -ne 0) {
+              throw "Inno Setup installation failed with exit code $LASTEXITCODE."
+            }
+          }
+
+      - name: Build application and installer
+        shell: pwsh
+        run: ./build_installer.ps1
+
+      - name: Verify application and package
+        shell: pwsh
+        run: |
+          $exePath = './release/MinecraftControlCenter.exe'
+          $version = (Get-Item -LiteralPath $exePath).VersionInfo
+          if ($version.ProductName -ne 'Minecraft Control Center') {
+            throw 'The built executable has unexpected product metadata.'
+          }
+          if ($version.ProductVersion -notlike "$($env:RELEASE_TAG.TrimStart('v')).*") {
+            throw 'The built executable version does not match the release tag.'
+          }
+
+          $zipPath = './release/MinecraftControlCenter.zip'
+          $expected = (Get-Content "$zipPath.sha256").Split(' ')[0]
+          $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) {
+            throw 'Release ZIP checksum verification failed.'
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+          }
+          finally {
+            $archive.Dispose()
+          }
+          $requiredEntries = @('MinecraftControlCenter.exe', 'PORTABLE_README.txt')
+          if (Compare-Object $entries $requiredEntries) {
+            throw 'The portable ZIP contains unexpected or missing files.'
+          }
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        run: |
+          $notesPath = "release-notes/$env:RELEASE_TAG.md"
+          $assets = @(
+            'release/MinecraftControlCenter.exe',
+            'release/MinecraftControlCenter-Setup.exe',
+            'release/MinecraftControlCenter.zip',
+            'release/MinecraftControlCenter.zip.sha256'
+          )
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+              --title "Minecraft Control Center $env:RELEASE_TAG" `
+              --notes-file $notesPath --latest --verify-tag
+            if ($LASTEXITCODE -ne 0) { throw 'Updating the GitHub Release failed.' }
+
+            gh release upload $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Uploading release assets failed.' }
+          }
+          else {
+            gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY `
+              --title "Minecraft Control Center $env:RELEASE_TAG" `
+              --notes-file $notesPath --latest --verify-tag
+            if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub Release failed.' }
+          }
