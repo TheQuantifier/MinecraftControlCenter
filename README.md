@@ -87,3 +87,23 @@ plugin system in v1.
 
 Change the version in both `src\VersionInfo.cs` and `src\AssemblyInfo.cs` before a
 release, then run `build_installer.ps1`.
+
+## Publishing a release
+
+Release notes and interface images use matching tag names under `release-notes`:
+
+```text
+release-notes/v1.0.0.md
+release-notes/v1.0.0.png
+```
+
+Run `capture_release_image.ps1` before committing and tagging a release. It builds the
+app, captures the current interface to the correctly versioned PNG, and adds the image
+reference to the matching Markdown file if needed. Pass `-ServerRoot` to capture a real
+Crafty configuration, or omit it to use an isolated display fixture.
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow requires the
+matching Markdown and PNG files, builds and verifies the packages, copies the Markdown
+into the GitHub Release description, and publishes only the installer, portable ZIP,
+and updater checksum. Force-updating a tag deliberately deletes and rebuilds its
+existing GitHub Release.

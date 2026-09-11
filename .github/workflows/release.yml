@@ -10,6 +10,11 @@ on:
         description: Existing version tag to publish
         required: true
         type: string
+      rebuild:
+        description: Delete and recreate an existing release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -19,6 +24,7 @@ jobs:
     runs-on: windows-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      REBUILD_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.rebuild || github.event.forced }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -50,6 +56,10 @@ jobs:
           $notesPath = "release-notes/$env:RELEASE_TAG.md"
           if (-not (Test-Path -LiteralPath $notesPath)) {
             throw "Missing release notes: $notesPath"
+          }
+          $imagePath = "release-notes/$env:RELEASE_TAG.png"
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+            throw "Missing release image: $imagePath"
           }
 
       - name: Install Inno Setup when needed
@@ -111,6 +121,10 @@ jobs:
             'release/MinecraftControlCenter.zip',
             'release/MinecraftControlCenter.zip.sha256'
           )
+
+          if ($env:REBUILD_RELEASE -eq 'true') {
+            gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --yes 2>$null
+          }
 
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
