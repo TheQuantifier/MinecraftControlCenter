@@ -649,21 +649,23 @@ internal sealed class CraftyLauncherSwitch : UserControl
 {
     private readonly List<object> items = new List<object>();
     private int selectedIndex = -1;
-    private int hoveredIndex = -1;
+    private bool hovered;
+    private ContextMenuStrip dropDownMenu;
 
     internal event EventHandler SelectedIndexChanged;
 
     internal CraftyLauncherSwitch()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
-            | ControlStyles.ResizeRedraw | ControlStyles.UserPaint | ControlStyles.Selectable, true);
-        BackColor = CraftyTheme.RaisedSurface;
-        ForeColor = CraftyTheme.Text;
-        Cursor = Cursors.Hand;
+            | ControlStyles.ResizeRedraw | ControlStyles.UserPaint | ControlStyles.Selectable
+            | ControlStyles.SupportsTransparentBackColor, true);
+        BackColor = Color.Transparent;
+        ForeColor = CraftyTheme.Heading;
+        Cursor = Cursors.Default;
         TabStop = true;
         AccessibleName = "Minecraft launcher";
-        AccessibleDescription = "Select Prism or TLauncher";
-        Size = new Size(175, 27);
+        AccessibleDescription = "Selected Minecraft launcher";
+        Size = new Size(155, 27);
     }
 
     internal List<object> Items { get { return items; } }
@@ -677,6 +679,7 @@ internal sealed class CraftyLauncherSwitch : UserControl
             if (selectedIndex == normalized)
                 return;
             selectedIndex = normalized;
+            UpdateInteraction();
             Invalidate();
             EventHandler changed = SelectedIndexChanged;
             if (changed != null)
@@ -692,7 +695,7 @@ internal sealed class CraftyLauncherSwitch : UserControl
 
     protected override void OnEnabledChanged(EventArgs e)
     {
-        Cursor = Enabled ? Cursors.Hand : Cursors.Default;
+        UpdateInteraction();
         Invalidate();
         base.OnEnabledChanged(e);
     }
@@ -700,17 +703,17 @@ internal sealed class CraftyLauncherSwitch : UserControl
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        int next = SegmentAt(e.X);
-        if (hoveredIndex != next)
+        bool next = Enabled && items.Count > 1 && ClientRectangle.Contains(e.Location);
+        if (hovered != next)
         {
-            hoveredIndex = next;
+            hovered = next;
             Invalidate();
         }
     }
 
     protected override void OnMouseLeave(EventArgs e)
     {
-        hoveredIndex = -1;
+        hovered = false;
         Invalidate();
         base.OnMouseLeave(e);
     }
@@ -720,90 +723,92 @@ internal sealed class CraftyLauncherSwitch : UserControl
         base.OnMouseDown(e);
         if (!Enabled || e.Button != MouseButtons.Left)
             return;
-        Focus();
-        int next = SegmentAt(e.X);
-        if (next >= 0)
-            SelectedIndex = next;
+        if (items.Count > 1)
+        {
+            Focus();
+            ShowDropDown();
+        }
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
-        if (!Enabled || items.Count == 0)
+        if (!Enabled || items.Count <= 1)
             return;
-        if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Up)
+        if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space || e.KeyCode == Keys.F4
+            || e.KeyCode == Keys.Down || (e.Alt && e.KeyCode == Keys.Down))
         {
-            SelectedIndex = selectedIndex <= 0 ? items.Count - 1 : selectedIndex - 1;
-            e.Handled = true;
-        }
-        else if (e.KeyCode == Keys.Right || e.KeyCode == Keys.Down || e.KeyCode == Keys.Space)
-        {
-            SelectedIndex = selectedIndex < 0 || selectedIndex >= items.Count - 1 ? 0 : selectedIndex + 1;
+            ShowDropDown();
             e.Handled = true;
         }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        Rectangle bounds = new Rectangle(0, 0, Math.Max(0, Width - 1), Math.Max(0, Height - 1));
-        using (GraphicsPath path = RoundedPanel.CreateRoundedPath(bounds, 7))
-        {
-            GraphicsState state = e.Graphics.Save();
-            e.Graphics.SetClip(path);
-            using (SolidBrush background = new SolidBrush(Enabled ? CraftyTheme.RaisedSurface : CraftyTheme.DisabledSurface))
-                e.Graphics.FillRectangle(background, bounds);
+        string text = Convert.ToString(SelectedItem);
+        if (String.IsNullOrWhiteSpace(text))
+            text = "Launcher";
+        bool canChoose = Enabled && items.Count > 1;
+        Color textColor = Enabled && items.Count > 0
+            ? (hovered && canChoose ? CraftyTheme.Primary : CraftyTheme.Heading)
+            : CraftyTheme.MutedText;
+        Rectangle textBounds = new Rectangle(0, 0, Math.Max(0, Width - (items.Count > 1 ? 22 : 0)), Height);
+        TextRenderer.DrawText(e.Graphics, text, Font, textBounds, textColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-            for (int index = 0; index < items.Count; index++)
+        if (items.Count > 1)
+        {
+            int centerX = Width - 10;
+            int centerY = Height / 2;
+            Point[] arrow =
             {
-                Rectangle segment = SegmentBounds(index);
-                Color fill = Color.Transparent;
-                if (index == selectedIndex)
-                    fill = Enabled ? CraftyTheme.Primary : CraftyTheme.DisabledSurface;
-                else if (Enabled && index == hoveredIndex)
-                    fill = Color.FromArgb(48, 54, 79);
-                if (fill.A > 0)
-                {
-                    using (SolidBrush brush = new SolidBrush(fill))
-                        e.Graphics.FillRectangle(brush, segment);
-                }
-            }
-            e.Graphics.Restore(state);
-
-            using (Pen outline = new Pen(Focused && Enabled ? CraftyTheme.Primary : CraftyTheme.Outline,
-                Focused && Enabled ? 1.8F : 1F))
-                e.Graphics.DrawPath(outline, path);
+                new Point(centerX - 4, centerY - 2),
+                new Point(centerX + 4, centerY - 2),
+                new Point(centerX, centerY + 3)
+            };
+            using (SolidBrush brush = new SolidBrush(canChoose ? textColor : CraftyTheme.MutedText))
+                e.Graphics.FillPolygon(brush, arrow);
         }
+    }
 
-        for (int index = 1; index < items.Count; index++)
+    private void UpdateInteraction()
+    {
+        bool canChoose = Enabled && items.Count > 1;
+        Cursor = canChoose ? Cursors.Hand : Cursors.Default;
+        TabStop = canChoose;
+        AccessibleRole = canChoose ? AccessibleRole.ComboBox : AccessibleRole.StaticText;
+        AccessibleDescription = canChoose ? "Choose a Minecraft launcher" : "Selected Minecraft launcher";
+    }
+
+    private void ShowDropDown()
+    {
+        if (!Enabled || items.Count <= 1)
+            return;
+        if (dropDownMenu != null)
         {
-            int separatorX = index * Width / items.Count;
-            using (Pen separator = new Pen(CraftyTheme.Outline))
-                e.Graphics.DrawLine(separator, separatorX, 4, separatorX, Height - 5);
+            dropDownMenu.Dispose();
+            dropDownMenu = null;
         }
 
+        dropDownMenu = new ContextMenuStrip();
+        dropDownMenu.ShowImageMargin = false;
+        dropDownMenu.BackColor = CraftyTheme.Surface;
+        dropDownMenu.ForeColor = CraftyTheme.Text;
+        dropDownMenu.Renderer = new CraftyMenuRenderer();
         for (int index = 0; index < items.Count; index++)
         {
-            Rectangle segment = SegmentBounds(index);
-            Color textColor = Enabled && index == selectedIndex ? Color.White
-                : (Enabled ? CraftyTheme.Text : CraftyTheme.MutedText);
-            TextRenderer.DrawText(e.Graphics, Convert.ToString(items[index]), Font, segment, textColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            int itemIndex = index;
+            ToolStripMenuItem item = new ToolStripMenuItem(Convert.ToString(items[index]));
+            item.AutoSize = false;
+            item.Size = new Size(Math.Max(155, Width), 30);
+            item.Font = Font;
+            item.ForeColor = index == selectedIndex ? Color.White : CraftyTheme.Text;
+            item.Checked = index == selectedIndex;
+            item.Click += delegate { SelectedIndex = itemIndex; };
+            dropDownMenu.Items.Add(item);
         }
-    }
-
-    private int SegmentAt(int x)
-    {
-        if (items.Count == 0 || x < 0 || x >= Width)
-            return -1;
-        return Math.Min(items.Count - 1, x * items.Count / Math.Max(1, Width));
-    }
-
-    private Rectangle SegmentBounds(int index)
-    {
-        int left = index * Width / Math.Max(1, items.Count);
-        int right = (index + 1) * Width / Math.Max(1, items.Count);
-        return new Rectangle(left, 0, Math.Max(1, right - left), Height);
+        dropDownMenu.Closed += delegate { hovered = false; Invalidate(); };
+        dropDownMenu.Show(this, new Point(0, Height));
     }
 }
 
@@ -1232,13 +1237,12 @@ internal sealed class ControlCenterForm : Form
         panel.Size = new Size(620, 56);
         Controls.Add(panel);
 
-        panel.Controls.Add(NewLabel(name, new Point(ProgramColumnLeft, 15), new Size(155, 27), 11F, true, CraftyTheme.Heading));
         if (name == "Launcher")
         {
             launcherSelector = new CraftyLauncherSwitch();
-            launcherSelector.Location = new Point(PurposeColumnLeft, 13);
-            launcherSelector.Size = new Size(175, 27);
-            launcherSelector.Font = new Font("Segoe UI", 9F, FontStyle.Regular);
+            launcherSelector.Location = new Point(ProgramColumnLeft, 13);
+            launcherSelector.Size = new Size(155, 27);
+            launcherSelector.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
 
             if (!String.IsNullOrWhiteSpace(prismPath))
                 launcherSelector.Items.Add("Prism");
@@ -1261,9 +1265,11 @@ internal sealed class ControlCenterForm : Form
                 }
             };
             panel.Controls.Add(launcherSelector);
+            panel.Controls.Add(NewLabel(description, new Point(PurposeColumnLeft, 17), new Size(175, 24), 10F, false, CraftyTheme.Text));
         }
         else
         {
+            panel.Controls.Add(NewLabel(name, new Point(ProgramColumnLeft, 15), new Size(155, 27), 11F, true, CraftyTheme.Heading));
             panel.Controls.Add(NewLabel(description, new Point(PurposeColumnLeft, 17), new Size(175, 24), 10F, false, CraftyTheme.Text));
         }
 
