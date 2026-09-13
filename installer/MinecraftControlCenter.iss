@@ -46,6 +46,7 @@ Filename: "{app}\MinecraftControlCenter.exe"; Description: "Launch Minecraft Con
 Type: files; Name: "{app}\MinecraftControlCenter.exe.new"
 Type: files; Name: "{app}\MinecraftControlCenter.exe.rollback"
 Type: filesandordirs; Name: "{localappdata}\MinecraftControlCenter"
+Type: files; Name: "{tmp}\MinecraftControlCenter-Uninstall-*.ps1"
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -56,9 +57,24 @@ var
   ShellObject: Variant;
   ShortcutObject: Variant;
   ShortcutTarget: String;
+  BrowserProfile: String;
+  PowerShellCommand: String;
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
+    BrowserProfile := ExpandConstant('{localappdata}\MinecraftControlCenter\BrowserProfile');
+    StringChangeEx(BrowserProfile, '''', '''''', True);
+    PowerShellCommand := '$p=''' + BrowserProfile + ''';' +
+      'for($i=0;$i -lt 12;$i++){$owned=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {' +
+      '($_.Name -ieq ''msedge.exe'' -or $_.Name -ieq ''chrome.exe'') -and $_.CommandLine -and ' +
+      '$_.CommandLine.IndexOf($p,[StringComparison]::OrdinalIgnoreCase) -ge 0});' +
+      'if($owned.Count -eq 0){break};$owned | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue};' +
+      'Start-Sleep -Milliseconds 250}';
+    Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -WindowStyle Hidden -Command "' + PowerShellCommand + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
     ShellObject := CreateOleObject('WScript.Shell');
     if LoadStringsFromFile(ExpandConstant('{localappdata}\MinecraftControlCenter\shortcuts.txt'), ShortcutPaths) then
       for Index := 0 to GetArrayLength(ShortcutPaths) - 1 do
@@ -76,4 +92,7 @@ begin
         end;
       end;
   end;
+
+  if CurUninstallStep = usPostUninstall then
+    DelTree(ExpandConstant('{localappdata}\MinecraftControlCenter'), True, True, True);
 end;

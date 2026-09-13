@@ -1060,6 +1060,8 @@ internal sealed class ControlCenterForm : Form
             && refreshPortsButton != null
             && gameServerPrompt != null
             && ShortcutIconManager.SelfTest()
+            && Uninstaller.SelfTest()
+            && CraftySessionLockSelfTest()
             && providers.Count == 4
             && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
             && launcherSelector.Items.Count ==
@@ -1523,6 +1525,13 @@ internal sealed class ControlCenterForm : Form
             return;
         }
 
+        string sessionLockError;
+        if (!RemoveStaleCraftySessionLock(out sessionLockError))
+        {
+            ShowError("Crafty could not be started because its session lock could not be validated.\r\n\r\n" + sessionLockError);
+            return;
+        }
+
         MarkStarting(CraftyKey);
         int dashboardVersion = Interlocked.Increment(ref craftyDashboardWaitVersion);
         try
@@ -1711,6 +1720,111 @@ internal sealed class ControlCenterForm : Form
             return new CredentialRecord { Username = username, Password = password };
         }
         catch { return null; }
+    }
+
+    private bool RemoveStaleCraftySessionLock(out string error)
+    {
+        string lockPath = Path.Combine(root, "app", "config", "session.lock");
+        return RemoveStaleCraftySessionLock(lockPath, craftyPath, 8443, out error);
+    }
+
+    private static bool RemoveStaleCraftySessionLock(string lockPath, string expectedCraftyPath, int dashboardPort, out string error)
+    {
+        error = String.Empty;
+        if (!File.Exists(lockPath))
+            return true;
+
+        try
+        {
+            string snapshot = File.ReadAllText(lockPath);
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            Dictionary<string, object> values = serializer.Deserialize<Dictionary<string, object>>(snapshot);
+            int recordedProcessId;
+            if (values == null || !values.ContainsKey("pid")
+                || !Int32.TryParse(Convert.ToString(values["pid"]), out recordedProcessId)
+                || recordedProcessId <= 0)
+                return true;
+
+            bool recordedProcessExists = false;
+            bool recordedProcessIsCrafty = false;
+            try
+            {
+                using (Process recordedProcess = Process.GetProcessById(recordedProcessId))
+                {
+                    recordedProcessExists = !recordedProcess.HasExited;
+                    if (recordedProcessExists)
+                    {
+                        string recordedPath;
+                        try { recordedPath = recordedProcess.MainModule.FileName; }
+                        catch (Exception ex)
+                        {
+                            error = "Windows could not verify the process recorded by Crafty's session lock: " + ex.Message;
+                            return false;
+                        }
+                        recordedProcessIsCrafty = PathsEqual(recordedPath, expectedCraftyPath);
+                    }
+                }
+            }
+            catch (ArgumentException) { }
+
+            if (recordedProcessExists && recordedProcessIsCrafty)
+                return true;
+            if (dashboardPort > 0 && IsLoopbackPortOpen(dashboardPort, 250))
+                return true;
+            if (!File.Exists(lockPath) || !File.ReadAllText(lockPath).Equals(snapshot, StringComparison.Ordinal))
+                return true;
+
+            File.Delete(lockPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static bool CraftySessionLockSelfTest()
+    {
+        string testDirectory = Path.Combine(Path.GetTempPath(), "MCC-crafty-lock-test-" + Guid.NewGuid().ToString("N"));
+        string lockPath = Path.Combine(testDirectory, "session.lock");
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            string contents = serializer.Serialize(new Dictionary<string, object>
+            {
+                { "pid", Process.GetCurrentProcess().Id },
+                { "started", DateTime.Now.ToString("O") }
+            });
+            File.WriteAllText(lockPath, contents);
+            string error;
+            bool retainedRealProcess = RemoveStaleCraftySessionLock(lockPath, Application.ExecutablePath, 0, out error)
+                && File.Exists(lockPath);
+            File.WriteAllText(lockPath, contents);
+            bool removedReusedProcessId = RemoveStaleCraftySessionLock(
+                lockPath, Path.Combine(testDirectory, "crafty.exe"), 0, out error) && !File.Exists(lockPath);
+            return retainedRealProcess && removedReusedProcessId;
+        }
+        catch { return false; }
+        finally
+        {
+            try { Directory.Delete(testDirectory, true); } catch { }
+        }
+    }
+
+    private static bool IsLoopbackPortOpen(int port, int timeoutMilliseconds)
+    {
+        try
+        {
+            using (TcpClient client = new TcpClient())
+            {
+                IAsyncResult result = client.BeginConnect(IPAddress.Loopback, port, null, null);
+                using (WaitHandle handle = result.AsyncWaitHandle)
+                    return handle.WaitOne(timeoutMilliseconds) && client.Connected;
+            }
+        }
+        catch { return false; }
     }
 
     private static int ReadDevToolsPort(string devToolsFile)
@@ -3087,6 +3201,11 @@ internal sealed class ControlCenterForm : Form
         int remaining = targets.Count(t => IsSameProcess(t, snapshot));
         if (stopCraftyServers && IsCraftyServerRunning())
             remaining++;
+        if (stopCraftyServers && remaining == 0)
+        {
+            string ignored;
+            RemoveStaleCraftySessionLock(out ignored);
+        }
         return new StopResult { Remaining = remaining };
     }
 
