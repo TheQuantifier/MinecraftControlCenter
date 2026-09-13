@@ -47,6 +47,9 @@ internal static class Program
             return 0;
         }
 
+        if (!selfTest && !screenshot)
+            ShortcutIconManager.RefreshOwnedShortcuts();
+
         AppLocations locations = AppConfiguration.ResolveLocations(!selfTest && !screenshot);
         string applicationRoot = locations.CraftyRoot;
         if (String.IsNullOrWhiteSpace(applicationRoot))
@@ -1056,6 +1059,7 @@ internal sealed class ControlCenterForm : Form
             && portCombo != null
             && refreshPortsButton != null
             && gameServerPrompt != null
+            && ShortcutIconManager.SelfTest()
             && providers.Count == 4
             && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
             && launcherSelector.Items.Count ==
@@ -1271,7 +1275,7 @@ internal sealed class ControlCenterForm : Form
             shortcutType.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath });
             shortcutType.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { root });
             shortcutType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { "Open Minecraft Control Center" });
-            shortcutType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath + ",0" });
+            shortcutType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { ShortcutIconManager.GetIconLocation() });
             shortcutType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, shortcut, null);
             AppConfiguration.RegisterShortcut(shortcutPath);
         }

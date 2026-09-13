@@ -19,5 +19,6 @@
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
     <EmbeddedResource Include="assets\minecraftbackground.jpg" LogicalName="MinecraftControlCenter.Background.jpg" />
+    <EmbeddedResource Include="assets\MinecraftControlCenter.ico" LogicalName="MinecraftControlCenter.Icon.ico" />
   </ItemGroup>
 </Project>
