@@ -1063,6 +1063,7 @@ internal sealed class ControlCenterForm : Form
             && Uninstaller.SelfTest()
             && CraftySessionLockSelfTest()
             && CraftyDatabaseRecoverySelfTest()
+            && CraftyLaunchInfoSelfTest()
             && StoppingStateSelfTest()
             && providers.Count == 4
             && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
@@ -1483,7 +1484,12 @@ internal sealed class ControlCenterForm : Form
 
     private void MarkStarting(string program)
     {
-        startingUntil[program] = DateTime.Now.AddSeconds(20);
+        MarkStarting(program, TimeSpan.FromSeconds(20));
+    }
+
+    private void MarkStarting(string program, TimeSpan timeout)
+    {
+        startingUntil[program] = DateTime.Now.Add(timeout);
         SetProgramState(program, "Starting");
         RefreshBatchButtons();
         Application.DoEvents();
@@ -1541,33 +1547,74 @@ internal sealed class ControlCenterForm : Form
             return;
         }
 
-        MarkStarting(CraftyKey);
+        TimeSpan readinessTimeout = TimeSpan.FromMinutes(2);
+        MarkStarting(CraftyKey, readinessTimeout);
         int dashboardVersion = Interlocked.Increment(ref craftyDashboardWaitVersion);
         try
         {
-            Process.Start(new ProcessStartInfo(craftyPath)
-            {
-                WorkingDirectory = root,
-                UseShellExecute = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                ErrorDialog = false
-            });
+            Process launchedProcess = Process.Start(CreateCraftyStartInfo(craftyPath, root));
+            if (launchedProcess == null)
+                throw new InvalidOperationException("Windows did not create the Crafty process.");
             InvalidateProcessCache();
             statusLabel.Text = "Starting Crafty and opening the dashboard...";
             ThreadPool.QueueUserWorkItem(delegate
             {
-                bool ready = WaitForPort(8443, TimeSpan.FromMinutes(2), delegate
+                bool ready = false;
+                bool exitedEarly = false;
+                int? exitCode = null;
+                DateTime startedAt = DateTime.UtcNow;
+                DateTime deadline = startedAt.Add(readinessTimeout);
+                try
                 {
-                    return dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion);
-                });
+                    while (dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion)
+                        && DateTime.UtcNow < deadline)
+                    {
+                        if (IsLoopbackPortOpen(8443, 500))
+                        {
+                            ready = true;
+                            break;
+                        }
+
+                        if (DateTime.UtcNow >= startedAt.AddSeconds(10))
+                        {
+                            try
+                            {
+                                if (launchedProcess.HasExited && !IsProgramRunningCore(CraftyKey))
+                                {
+                                    exitCode = launchedProcess.ExitCode;
+                                    exitedEarly = true;
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
+                        Thread.Sleep(500);
+                    }
+                }
+                finally { launchedProcess.Dispose(); }
                 try
                 {
                     BeginInvoke((MethodInvoker)delegate
                     {
                         if (ready && dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion))
                             OpenCraftyDashboard();
-                        else if (dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion) && IsProgramRunning(CraftyKey))
-                            statusLabel.Text = "Crafty started, but its dashboard did not become ready.";
+                        else if (dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion))
+                        {
+                            startingUntil.Remove(CraftyKey);
+                            InvalidateProcessCache();
+                            RefreshProgramButtons();
+                            if (IsProgramRunning(CraftyKey))
+                                statusLabel.Text = "Crafty started, but its dashboard did not become ready.";
+                            else
+                            {
+                                statusLabel.Text = "Crafty failed to start.";
+                                string detail = exitedEarly
+                                    ? "Crafty exited before its dashboard became ready"
+                                        + (exitCode.HasValue ? " (exit code " + exitCode.Value + ")" : String.Empty) + "."
+                                    : "Crafty did not start within two minutes.";
+                                ShowError(detail + "\r\n\r\nTry starting Crafty directly to view its console error.");
+                            }
+                        }
                     });
                 }
                 catch { }
@@ -1579,6 +1626,18 @@ internal sealed class ControlCenterForm : Form
             RefreshProgramButtons();
             ShowError("Could not start Crafty.\r\n\r\n" + ex.Message);
         }
+    }
+
+    private static ProcessStartInfo CreateCraftyStartInfo(string executablePath, string workingDirectory)
+    {
+        return new ProcessStartInfo(executablePath)
+        {
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            ErrorDialog = false
+        };
     }
 
     private void StartPlayit()
@@ -1996,6 +2055,17 @@ internal sealed class ControlCenterForm : Form
         {
             try { Directory.Delete(testDirectory, true); } catch { }
         }
+    }
+
+    private bool CraftyLaunchInfoSelfTest()
+    {
+        ProcessStartInfo startInfo = CreateCraftyStartInfo(craftyPath, root);
+        return PathsEqual(startInfo.FileName, craftyPath)
+            && PathsEqual(startInfo.WorkingDirectory, root)
+            && !startInfo.UseShellExecute
+            && startInfo.CreateNoWindow
+            && startInfo.WindowStyle == ProcessWindowStyle.Hidden
+            && !startInfo.ErrorDialog;
     }
 
     private bool StoppingStateSelfTest()
