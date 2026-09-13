@@ -1633,8 +1633,11 @@ internal sealed class ControlCenterForm : Form
         return new ProcessStartInfo(executablePath)
         {
             WorkingDirectory = workingDirectory,
-            UseShellExecute = false,
-            CreateNoWindow = true,
+            // Crafty's interactive command loop requires the console stream
+            // Windows creates for a shell-launched console executable. Using
+            // CreateNoWindow makes Crafty receive EOF and exit cleanly with 0.
+            UseShellExecute = true,
+            CreateNoWindow = false,
             WindowStyle = ProcessWindowStyle.Hidden,
             ErrorDialog = false
         };
@@ -2062,8 +2065,8 @@ internal sealed class ControlCenterForm : Form
         ProcessStartInfo startInfo = CreateCraftyStartInfo(craftyPath, root);
         return PathsEqual(startInfo.FileName, craftyPath)
             && PathsEqual(startInfo.WorkingDirectory, root)
-            && !startInfo.UseShellExecute
-            && startInfo.CreateNoWindow
+            && startInfo.UseShellExecute
+            && !startInfo.CreateNoWindow
             && startInfo.WindowStyle == ProcessWindowStyle.Hidden
             && !startInfo.ErrorDialog;
     }
