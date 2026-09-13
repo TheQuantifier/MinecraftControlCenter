@@ -1062,6 +1062,8 @@ internal sealed class ControlCenterForm : Form
             && ShortcutIconManager.SelfTest()
             && Uninstaller.SelfTest()
             && CraftySessionLockSelfTest()
+            && CraftyDatabaseRecoverySelfTest()
+            && StoppingStateSelfTest()
             && providers.Count == 4
             && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
             && launcherSelector.Items.Count ==
@@ -1532,6 +1534,13 @@ internal sealed class ControlCenterForm : Form
             return;
         }
 
+        string databaseRecoveryError;
+        if (!PrepareCraftyDatabaseForStart(out databaseRecoveryError))
+        {
+            ShowError("Crafty could not be started because its database state could not be prepared.\r\n\r\n" + databaseRecoveryError);
+            return;
+        }
+
         MarkStarting(CraftyKey);
         int dashboardVersion = Interlocked.Increment(ref craftyDashboardWaitVersion);
         try
@@ -1555,7 +1564,7 @@ internal sealed class ControlCenterForm : Form
                 {
                     BeginInvoke((MethodInvoker)delegate
                     {
-                        if (ready && dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion) && IsProgramRunning(CraftyKey))
+                        if (ready && dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion))
                             OpenCraftyDashboard();
                         else if (dashboardVersion == Volatile.Read(ref craftyDashboardWaitVersion) && IsProgramRunning(CraftyKey))
                             statusLabel.Text = "Crafty started, but its dashboard did not become ready.";
@@ -1799,17 +1808,216 @@ internal sealed class ControlCenterForm : Form
             });
             File.WriteAllText(lockPath, contents);
             string error;
+            int verifiedProcessId;
+            DateTime verifiedStartTimeUtc;
+            bool recognizedRealProcess = TryGetVerifiedCraftyLockProcess(
+                lockPath, Application.ExecutablePath, out verifiedProcessId, out verifiedStartTimeUtc)
+                && verifiedProcessId == Process.GetCurrentProcess().Id
+                && verifiedStartTimeUtc != DateTime.MinValue;
             bool retainedRealProcess = RemoveStaleCraftySessionLock(lockPath, Application.ExecutablePath, 0, out error)
                 && File.Exists(lockPath);
             File.WriteAllText(lockPath, contents);
             bool removedReusedProcessId = RemoveStaleCraftySessionLock(
                 lockPath, Path.Combine(testDirectory, "crafty.exe"), 0, out error) && !File.Exists(lockPath);
-            return retainedRealProcess && removedReusedProcessId;
+            return recognizedRealProcess && retainedRealProcess && removedReusedProcessId;
         }
         catch { return false; }
         finally
         {
             try { Directory.Delete(testDirectory, true); } catch { }
+        }
+    }
+
+    private bool TryGetVerifiedCraftyLockProcess(out int processId, out DateTime startTimeUtc)
+    {
+        return TryGetVerifiedCraftyLockProcess(
+            Path.Combine(root, "app", "config", "session.lock"), craftyPath, out processId, out startTimeUtc);
+    }
+
+    private static bool TryGetVerifiedCraftyLockProcess(
+        string lockPath, string expectedCraftyPath, out int processId, out DateTime startTimeUtc)
+    {
+        processId = 0;
+        startTimeUtc = DateTime.MinValue;
+        try
+        {
+            if (!File.Exists(lockPath))
+                return false;
+            Dictionary<string, object> values = new JavaScriptSerializer()
+                .Deserialize<Dictionary<string, object>>(File.ReadAllText(lockPath));
+            int recordedProcessId;
+            if (values == null || !values.ContainsKey("pid")
+                || !Int32.TryParse(Convert.ToString(values["pid"]), out recordedProcessId)
+                || recordedProcessId <= 0)
+                return false;
+            using (Process process = Process.GetProcessById(recordedProcessId))
+            {
+                if (process.HasExited || !PathsEqual(process.MainModule.FileName, expectedCraftyPath))
+                    return false;
+                processId = recordedProcessId;
+                startTimeUtc = process.StartTime.ToUniversalTime();
+                return true;
+            }
+        }
+        catch { return false; }
+    }
+
+    private bool IsSameVerifiedCraftyProcess(int processId, DateTime startTimeUtc)
+    {
+        if (processId <= 0 || startTimeUtc == DateTime.MinValue)
+            return false;
+        try
+        {
+            using (Process process = Process.GetProcessById(processId))
+                return !process.HasExited
+                    && process.StartTime.ToUniversalTime() == startTimeUtc
+                    && PathsEqual(process.MainModule.FileName, craftyPath);
+        }
+        catch { return false; }
+    }
+
+    private List<VerifiedProcessIdentity> GetVerifiedCraftyProcesses()
+    {
+        List<VerifiedProcessIdentity> matches = new List<VerifiedProcessIdentity>();
+        string processName = Path.GetFileNameWithoutExtension(craftyPath);
+        if (String.IsNullOrWhiteSpace(processName))
+            return matches;
+        foreach (Process process in Process.GetProcessesByName(processName))
+        {
+            try
+            {
+                if (!process.HasExited && PathsEqual(process.MainModule.FileName, craftyPath))
+                {
+                    matches.Add(new VerifiedProcessIdentity
+                    {
+                        Id = process.Id,
+                        StartTimeUtc = process.StartTime.ToUniversalTime()
+                    });
+                }
+            }
+            catch { }
+            finally { process.Dispose(); }
+        }
+        return matches;
+    }
+
+    private bool IsSameVerifiedCraftyProcess(VerifiedProcessIdentity expected)
+    {
+        return expected != null && IsSameVerifiedCraftyProcess(expected.Id, expected.StartTimeUtc);
+    }
+
+    private static void AddVerifiedProcess(
+        List<VerifiedProcessIdentity> processes, int processId, DateTime startTimeUtc)
+    {
+        if (processId > 0 && startTimeUtc != DateTime.MinValue
+            && !processes.Any(process => process.Id == processId))
+        {
+            processes.Add(new VerifiedProcessIdentity
+            {
+                Id = processId,
+                StartTimeUtc = startTimeUtc
+            });
+        }
+    }
+
+    private bool PrepareCraftyDatabaseForStart(out string error)
+    {
+        error = String.Empty;
+        int lockedProcessId;
+        DateTime lockedStartTimeUtc;
+        if (ReadProcessTable(true).Values.Any(process => PathsEqual(process.ExecutablePath, craftyPath))
+            || TryGetVerifiedCraftyLockProcess(out lockedProcessId, out lockedStartTimeUtc))
+        {
+            error = "Crafty is already running.";
+            return false;
+        }
+        if (IsLoopbackPortOpen(8443, 250))
+        {
+            error = "Port 8443 is already in use.";
+            return false;
+        }
+        return ResetCraftySqliteSidecars(Path.Combine(root, "app", "config", "db", "crafty.sqlite"), out error);
+    }
+
+    private static bool ResetCraftySqliteSidecars(string databasePath, out string error)
+    {
+        error = String.Empty;
+        try
+        {
+            string databaseDirectory = Path.GetDirectoryName(databasePath);
+            if (!Directory.Exists(databaseDirectory))
+                return true;
+
+            foreach (string path in new[] { databasePath, databasePath + "-wal", databasePath + "-shm" })
+            {
+                if (!File.Exists(path))
+                    continue;
+                FileAttributes attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+            }
+
+            // The SHM file is only a transient WAL index. With Crafty fully
+            // stopped, SQLite safely rebuilds it from the database and WAL.
+            // The WAL itself is deliberately preserved so committed data is not lost.
+            string sharedMemoryPath = databasePath + "-shm";
+            if (File.Exists(sharedMemoryPath))
+                File.Delete(sharedMemoryPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static bool CraftyDatabaseRecoverySelfTest()
+    {
+        string testDirectory = Path.Combine(Path.GetTempPath(), "MCC-crafty-database-test-" + Guid.NewGuid().ToString("N"));
+        string databasePath = Path.Combine(testDirectory, "crafty.sqlite");
+        string walPath = databasePath + "-wal";
+        string sharedMemoryPath = databasePath + "-shm";
+        try
+        {
+            Directory.CreateDirectory(testDirectory);
+            File.WriteAllText(databasePath, "database");
+            File.WriteAllText(walPath, "committed-wal-data");
+            File.WriteAllText(sharedMemoryPath, "rebuildable-index");
+            File.SetAttributes(sharedMemoryPath, File.GetAttributes(sharedMemoryPath) | FileAttributes.ReadOnly);
+            string error;
+            return ResetCraftySqliteSidecars(databasePath, out error)
+                && File.ReadAllText(databasePath) == "database"
+                && File.ReadAllText(walPath) == "committed-wal-data"
+                && !File.Exists(sharedMemoryPath);
+        }
+        catch { return false; }
+        finally
+        {
+            try { Directory.Delete(testDirectory, true); } catch { }
+        }
+    }
+
+    private bool StoppingStateSelfTest()
+    {
+        try
+        {
+            cancellingPrograms.Add(CraftyKey);
+            SetProgramState(CraftyKey, "Stopping");
+            RefreshBatchButtons();
+            Button craftyButton = programButtons[CraftyKey];
+            return !craftyButton.Enabled
+                && craftyButton.Text == "Stopping..."
+                && !startAllButton.Enabled
+                && startAllButton.Text == "Stopping..."
+                && !stopAllButton.Enabled
+                && stopAllButton.Text == "Stopping...";
+        }
+        catch { return false; }
+        finally
+        {
+            cancellingPrograms.Remove(CraftyKey);
+            RefreshProgramButtons();
         }
     }
 
@@ -2708,7 +2916,15 @@ internal sealed class ControlCenterForm : Form
             return IsSelectedLauncherRunning();
 
         string expectedPath = program == CraftyKey ? craftyPath : playitPath;
-        return ReadProcessTable(false).Values.Any(p => PathsEqual(p.ExecutablePath, expectedPath));
+        if (ReadProcessTable(false).Values.Any(p => PathsEqual(p.ExecutablePath, expectedPath)))
+            return true;
+        if (program == CraftyKey)
+        {
+            int processId;
+            DateTime startTimeUtc;
+            return TryGetVerifiedCraftyLockProcess(out processId, out startTimeUtc);
+        }
+        return false;
     }
 
     private bool IsSelectedLauncherRunning()
@@ -2906,7 +3122,11 @@ internal sealed class ControlCenterForm : Form
         {
             SetBatchButtonDisabled(startAllButton, "Started");
         }
-        else if (anyWaiting || anyCancelling)
+        else if (anyCancelling)
+        {
+            SetBatchButtonDisabled(startAllButton, "Stopping...");
+        }
+        else if (anyWaiting)
         {
             SetBatchButtonDisabled(startAllButton, "Waiting...");
         }
@@ -2923,7 +3143,11 @@ internal sealed class ControlCenterForm : Form
             startAllButton.FlatStyle = FlatStyle.Flat;
         }
 
-        if (anyRunning || anyStarting || anyWaiting || anyCancelling)
+        if (anyCancelling)
+        {
+            SetBatchButtonDisabled(stopAllButton, "Stopping...");
+        }
+        else if (anyRunning || anyStarting || anyWaiting)
         {
             stopAllButton.Text = "Stop ALL";
             stopAllButton.Enabled = true;
@@ -2976,12 +3200,12 @@ internal sealed class ControlCenterForm : Form
 
     private void StopProgram(string program)
     {
+        cancellingPrograms.Add(program);
         SetProgramState(program, "Stopping");
         Application.DoEvents();
         if (program == CraftyKey)
             Interlocked.Increment(ref craftyDashboardWaitVersion);
         CancelWait(program);
-        cancellingPrograms.Remove(program);
         List<ProcessRecord> targets = GetProcessesToStop(new[] { program });
         ThreadPool.QueueUserWorkItem(delegate
         {
@@ -2991,12 +3215,17 @@ internal sealed class ControlCenterForm : Form
                 BeginInvoke((MethodInvoker)delegate
                 {
                     startingUntil.Remove(program);
+                    cancellingPrograms.Remove(program);
                     InvalidateProcessCache();
                     RefreshProgramButtons();
                     string displayName = program == PlayitKey ? "PlayIt" : program;
-                    statusLabel.Text = result.Remaining == 0
+                    statusLabel.Text = !String.IsNullOrWhiteSpace(result.Error)
+                        ? displayName + " stopped, but cleanup needs attention."
+                        : result.Remaining == 0
                         ? displayName + " stopped."
                         : displayName + " did not close safely; it was left running.";
+                    if (!String.IsNullOrWhiteSpace(result.Error))
+                        ShowError(result.Error);
                 });
             }
             catch { }
@@ -3012,7 +3241,10 @@ internal sealed class ControlCenterForm : Form
             return;
 
         foreach (string program in programButtons.Keys)
+        {
+            cancellingPrograms.Add(program);
             SetProgramState(program, "Stopping");
+        }
         startAllButton.Enabled = false;
         SetBatchButtonDisabled(stopAllButton, "Stopping...");
         Application.DoEvents();
@@ -3020,7 +3252,6 @@ internal sealed class ControlCenterForm : Form
         Interlocked.Increment(ref craftyDashboardWaitVersion);
         List<ProcessRecord> targets = GetProcessesToStop(new[] { CraftyKey, PlayitKey, LauncherKey, GameKey });
         CancelAllWaits();
-        cancellingPrograms.Clear();
         ThreadPool.QueueUserWorkItem(delegate
         {
             StopResult result = StopProgramsSafely(targets, true);
@@ -3029,9 +3260,15 @@ internal sealed class ControlCenterForm : Form
                 BeginInvoke((MethodInvoker)delegate
                 {
                     startingUntil.Clear();
+                    cancellingPrograms.Clear();
                     InvalidateProcessCache();
                     RefreshProgramButtons();
-                    if (targets.Count == 0)
+                    if (!String.IsNullOrWhiteSpace(result.Error))
+                    {
+                        statusLabel.Text = "Programs stopped, but Crafty cleanup needs attention.";
+                        ShowError(result.Error);
+                    }
+                    else if (targets.Count == 0)
                         statusLabel.Text = "Nothing is currently running.";
                     else if (result.Remaining == 0)
                         statusLabel.Text = "Crafty, PlayIt, dashboard, " + (HasSelectedLauncher ? SelectedLauncher + ", " : String.Empty) + "and Game stopped.";
@@ -3139,9 +3376,19 @@ internal sealed class ControlCenterForm : Form
             }
         }
 
-        // Every owned desktop program receives only its normal window-close
-        // request. Crafty handles its own shutdown path if the API command was
-        // unavailable; no process is force-killed.
+        List<VerifiedProcessIdentity> verifiedCraftyProcesses = stopCraftyServers
+            ? GetVerifiedCraftyProcesses()
+            : new List<VerifiedProcessIdentity>();
+        int lockedCraftyProcessId = 0;
+        DateTime lockedCraftyStartTimeUtc = DateTime.MinValue;
+        if (stopCraftyServers)
+        {
+            if (TryGetVerifiedCraftyLockProcess(out lockedCraftyProcessId, out lockedCraftyStartTimeUtc))
+                AddVerifiedProcess(verifiedCraftyProcesses, lockedCraftyProcessId, lockedCraftyStartTimeUtc);
+        }
+
+        // Every owned desktop program receives its normal window-close request
+        // before a force-stop is considered.
         List<ProcessRecord> closeNow = targets.ToList();
         Dictionary<int, ProcessRecord> snapshot = ReadProcessTable(true);
         foreach (ProcessRecord target in closeNow)
@@ -3159,22 +3406,33 @@ internal sealed class ControlCenterForm : Form
             }
             catch { }
         }
+        foreach (VerifiedProcessIdentity craftyProcess in verifiedCraftyProcesses.Where(IsSameVerifiedCraftyProcess))
+        {
+            try
+            {
+                using (Process process = Process.GetProcessById(craftyProcess.Id))
+                    if (process.MainWindowHandle != IntPtr.Zero)
+                        process.CloseMainWindow();
+                RequestHiddenWindowClose(craftyProcess.Id);
+            }
+            catch { }
+        }
 
         DateTime deadline = DateTime.UtcNow.AddSeconds(20);
         while (DateTime.UtcNow < deadline)
         {
             snapshot = ReadProcessTable(true);
-            if (!closeNow.Any(t => IsSameProcess(t, snapshot)))
+            if (!closeNow.Any(t => IsSameProcess(t, snapshot))
+                && !verifiedCraftyProcesses.Any(IsSameVerifiedCraftyProcess))
                 break;
             Thread.Sleep(250);
         }
 
         snapshot = ReadProcessTable(true);
-        bool craftyServersStopped = !IsCraftyServerRunning();
         foreach (ProcessRecord target in targets.Where(t => IsSameProcess(t, snapshot)))
         {
             bool authorizedPlayit = PathsEqual(target.ExecutablePath, playitPath);
-            bool authorizedCrafty = PathsEqual(target.ExecutablePath, craftyPath) && craftyServersStopped;
+            bool authorizedCrafty = stopCraftyServers && PathsEqual(target.ExecutablePath, craftyPath);
             if (!authorizedPlayit && !authorizedCrafty)
                 continue;
             try
@@ -3187,26 +3445,60 @@ internal sealed class ControlCenterForm : Form
             }
             catch { }
         }
+        // Re-scan after the graceful wait so a PyInstaller child that appeared
+        // during shutdown is still verified and included in the fallback kill.
+        if (stopCraftyServers)
+        {
+            foreach (VerifiedProcessIdentity process in GetVerifiedCraftyProcesses())
+                AddVerifiedProcess(verifiedCraftyProcesses, process.Id, process.StartTimeUtc);
+        }
+        foreach (VerifiedProcessIdentity craftyProcess in verifiedCraftyProcesses.Where(IsSameVerifiedCraftyProcess))
+        {
+            try
+            {
+                using (Process process = Process.GetProcessById(craftyProcess.Id))
+                    process.Kill();
+            }
+            catch { }
+        }
 
         DateTime forceDeadline = DateTime.UtcNow.AddSeconds(5);
         while (DateTime.UtcNow < forceDeadline)
         {
             snapshot = ReadProcessTable(true);
-            if (!targets.Any(t => IsSameProcess(t, snapshot)))
+            if (!targets.Any(t => IsSameProcess(t, snapshot))
+                && !verifiedCraftyProcesses.Any(IsSameVerifiedCraftyProcess)
+                && (!stopCraftyServers || GetVerifiedCraftyProcesses().Count == 0))
                 break;
             Thread.Sleep(200);
         }
 
         snapshot = ReadProcessTable(true);
-        int remaining = targets.Count(t => IsSameProcess(t, snapshot));
+        HashSet<int> remainingProcessIds = new HashSet<int>(
+            targets.Where(target => IsSameProcess(target, snapshot)).Select(target => target.Id));
+        List<VerifiedProcessIdentity> survivingCraftyProcesses = stopCraftyServers
+            ? GetVerifiedCraftyProcesses()
+            : new List<VerifiedProcessIdentity>();
+        foreach (VerifiedProcessIdentity process in survivingCraftyProcesses)
+            remainingProcessIds.Add(process.Id);
+        int remaining = remainingProcessIds.Count;
         if (stopCraftyServers && IsCraftyServerRunning())
             remaining++;
-        if (stopCraftyServers && remaining == 0)
+        string recoveryError = String.Empty;
+        bool craftyManagerRunning = snapshot.Values.Any(process => PathsEqual(process.ExecutablePath, craftyPath))
+            || survivingCraftyProcesses.Count != 0;
+        if (stopCraftyServers && !craftyManagerRunning)
         {
-            string ignored;
-            RemoveStaleCraftySessionLock(out ignored);
+            if (!ResetCraftySqliteSidecars(Path.Combine(root, "app", "config", "db", "crafty.sqlite"), out recoveryError))
+                recoveryError = "Crafty's database recovery failed: " + recoveryError;
+            else
+            {
+                string lockError;
+                if (!RemoveStaleCraftySessionLock(out lockError))
+                    recoveryError = "Crafty's session lock cleanup failed: " + lockError;
+            }
         }
-        return new StopResult { Remaining = remaining };
+        return new StopResult { Remaining = remaining, Error = recoveryError };
     }
 
     private static void RequestHiddenWindowClose(int processId)
@@ -3307,6 +3599,12 @@ internal sealed class ControlCenterForm : Form
         internal string CreationDate = String.Empty;
     }
 
+    private sealed class VerifiedProcessIdentity
+    {
+        internal int Id;
+        internal DateTime StartTimeUtc;
+    }
+
     private sealed class GameEndpoint
     {
         internal string Host = String.Empty;
@@ -3318,6 +3616,7 @@ internal sealed class ControlCenterForm : Form
     private sealed class StopResult
     {
         internal int Remaining;
+        internal string Error = String.Empty;
     }
 
     private sealed class PrismMatch
