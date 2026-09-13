@@ -1651,7 +1651,12 @@ internal sealed class ControlCenterForm : Form
         string devToolsFile = Path.Combine(browserProfile, "DevToolsActivePort");
         Directory.CreateDirectory(browserProfile);
         HardenDirectory(browserProfile);
-        try { if (File.Exists(devToolsFile)) File.Delete(devToolsFile); }
+        try
+        {
+            int existingPort = ReadDevToolsPort(devToolsFile);
+            if (!IsDevToolsEndpointActive(existingPort) && File.Exists(devToolsFile))
+                File.Delete(devToolsFile);
+        }
         catch { }
 
         string arguments = "--app=\"https://localhost:8443\" --user-data-dir=\"" + browserProfile
@@ -1721,6 +1726,22 @@ internal sealed class ControlCenterForm : Form
         catch { return 0; }
     }
 
+    private static bool IsDevToolsEndpointActive(int port)
+    {
+        if (port < 1 || port > 65535)
+            return false;
+        try
+        {
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/json/version");
+            request.Proxy = null;
+            request.Timeout = 750;
+            request.ReadWriteTimeout = 750;
+            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                return response.StatusCode == HttpStatusCode.OK;
+        }
+        catch { return false; }
+    }
+
     private static string FindDashboardWebSocket(int port)
     {
         try
@@ -1777,9 +1798,10 @@ internal sealed class ControlCenterForm : Form
             string expression = "(function(){"
                 + "var u=document.querySelector('#username,input[name=username],input[type=email]'),p=document.querySelector('#password,input[name=password],input[type=password]');"
                 + "var f=(u&&u.closest('form'))||document.getElementById('login-form');"
-                + "if(!u||!p||!f||window.__craftyControlCenterLogin)return false;"
+                + "if(document.readyState!=='complete'||!u||!p||!f||window.__craftyControlCenterLogin)return false;"
                 + "window.__craftyControlCenterLogin=true;u.value=" + userJson + ";p.value=" + passwordJson + ";"
-                + "u.dispatchEvent(new Event('input',{bubbles:true}));p.dispatchEvent(new Event('input',{bubbles:true}));"
+                + "u.dispatchEvent(new Event('input',{bubbles:true}));u.dispatchEvent(new Event('change',{bubbles:true}));"
+                + "p.dispatchEvent(new Event('input',{bubbles:true}));p.dispatchEvent(new Event('change',{bubbles:true}));"
                 + "if(f.requestSubmit)f.requestSubmit();else{var b=f.querySelector('[type=submit]');if(b)b.click();}return true;})()";
             return EvaluateDevToolsExpression(webSocketUrl, expression, false);
         }
@@ -1826,7 +1848,13 @@ internal sealed class ControlCenterForm : Form
                 response.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
             }
             while (!result.EndOfMessage);
-            return response.ToString().IndexOf("\"value\":true", StringComparison.OrdinalIgnoreCase) >= 0;
+            Dictionary<string, object> envelope = serializer.DeserializeObject(response.ToString()) as Dictionary<string, object>;
+            Dictionary<string, object> resultEnvelope = envelope != null && envelope.ContainsKey("result")
+                ? envelope["result"] as Dictionary<string, object> : null;
+            Dictionary<string, object> evaluation = resultEnvelope != null && resultEnvelope.ContainsKey("result")
+                ? resultEnvelope["result"] as Dictionary<string, object> : null;
+            return evaluation != null && evaluation.ContainsKey("value")
+                && evaluation["value"] is bool && (bool)evaluation["value"];
         }
     }
 
