@@ -174,16 +174,27 @@ internal static class Updater
         return "$ErrorActionPreference='Stop'\r\n$pidToWait=" + Process.GetCurrentProcess().Id + "\r\n"
             + "$exe='" + Q(exe) + "'\r\n$staged='" + Q(stagedExe) + "'\r\n$readme='" + Q(readme) + "'\r\n"
             + "$backup=$exe+'.rollback'\r\n$new=$exe+'.new'\r\n$log='" + Q(log) + "'\r\n"
+            + "function Start-MccStandardUser { $shell=Join-Path $env:WINDIR 'explorer.exe'; Start-Process -FilePath $shell -ArgumentList ('\"'+$exe+'\"') }\r\n"
             + "for($i=0;$i -lt 240;$i++){if(-not(Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}\r\n"
             + "try {\r\n Remove-Item -LiteralPath $new,$backup -Force -ErrorAction SilentlyContinue\r\n"
             + " Copy-Item -LiteralPath $staged -Destination $new -Force\r\n [IO.File]::Replace($new,$exe,$backup,$true)\r\n"
             + " if(Test-Path -LiteralPath $readme){Copy-Item -LiteralPath $readme -Destination (Join-Path '" + Q(installDirectory) + "' 'README.txt') -Force}\r\n"
-            + " Start-Process -FilePath $exe\r\n Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\r\n"
+            + " Start-MccStandardUser\r\n Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\r\n"
             + " Remove-Item -LiteralPath '" + Q(updateRoot) + "' -Recurse -Force -ErrorAction SilentlyContinue\r\n"
             + "} catch {\r\n if(Test-Path -LiteralPath $backup){Copy-Item -LiteralPath $backup -Destination $exe -Force}\r\n"
             + " $_ | Out-String | Set-Content -LiteralPath $log\r\n Add-Type -AssemblyName PresentationFramework\r\n"
             + " [System.Windows.MessageBox]::Show('The update failed and the previous version was restored. See '+$log,'Minecraft Control Center')|Out-Null\r\n"
-            + " if(Test-Path -LiteralPath $exe){Start-Process -FilePath $exe}\r\n}\r\n";
+            + " if(Test-Path -LiteralPath $exe){Start-MccStandardUser}\r\n}\r\n";
+    }
+
+    internal static bool SelfTest()
+    {
+        string script = BuildUpdateScript(@"C:\MCC Test\stage", @"C:\Program Files\MinecraftControlCenter", @"C:\MCC Test");
+        return script.Contains("function Start-MccStandardUser")
+            && script.Contains("Start-Process -FilePath $shell")
+            && script.Contains("Start-MccStandardUser\r\n Remove-Item")
+            && script.Contains("if(Test-Path -LiteralPath $exe){Start-MccStandardUser}")
+            && !script.Contains("Start-Process -FilePath $exe");
     }
 
     private static string Q(string value) { return value.Replace("'", "''"); }

@@ -37,6 +37,13 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        // The elevated update helper used by older releases starts the new
+        // executable with its administrator token and inherited console state.
+        // Relaunch through the interactive Explorer session before creating the
+        // single-instance mutex so provider processes start as the signed-in user.
+        if (!selfTest && !screenshot && ElevationRelaunch.RelaunchIfNeeded())
+            return 0;
+
         bool firstInstance;
         singleInstance = new Mutex(true, @"Local\MinecraftControlCenter.SingleInstance", out firstInstance);
         if (!firstInstance)
@@ -99,6 +106,81 @@ internal static class Program
             Application.Run(form);
         }
         return 0;
+    }
+}
+
+internal static class ElevationRelaunch
+{
+    private static readonly string GuardPath = Path.Combine(
+        Path.GetTempPath(), "MinecraftControlCenter-standard-user-relaunch.guard");
+
+    internal static bool RelaunchIfNeeded()
+    {
+        if (!IsElevated())
+        {
+            TryDeleteGuard();
+            return false;
+        }
+
+        try
+        {
+            // Prevent a loop on systems where Explorer itself is elevated. The
+            // second process is still detached from the updater's console state.
+            if (File.Exists(GuardPath)
+                && DateTime.UtcNow - File.GetLastWriteTimeUtc(GuardPath) < TimeSpan.FromMinutes(1))
+            {
+                TryDeleteGuard();
+                return false;
+            }
+
+            File.WriteAllText(GuardPath, Process.GetCurrentProcess().Id.ToString());
+            Process process = Process.Start(CreateExplorerStartInfo(Application.ExecutablePath));
+            if (process == null)
+            {
+                TryDeleteGuard();
+                return false;
+            }
+            process.Dispose();
+            return true;
+        }
+        catch
+        {
+            TryDeleteGuard();
+            return false;
+        }
+    }
+
+    internal static bool SelfTest()
+    {
+        ProcessStartInfo startInfo = CreateExplorerStartInfo(@"C:\Program Files\MinecraftControlCenter\MinecraftControlCenter.exe");
+        return Path.GetFileName(startInfo.FileName).Equals("explorer.exe", StringComparison.OrdinalIgnoreCase)
+            && startInfo.Arguments == "\"C:\\Program Files\\MinecraftControlCenter\\MinecraftControlCenter.exe\""
+            && startInfo.UseShellExecute;
+    }
+
+    private static bool IsElevated()
+    {
+        try
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
+    private static ProcessStartInfo CreateExplorerStartInfo(string executablePath)
+    {
+        return new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+            "\"" + executablePath + "\"")
+        {
+            UseShellExecute = true,
+            ErrorDialog = false
+        };
+    }
+
+    private static void TryDeleteGuard()
+    {
+        try { if (File.Exists(GuardPath)) File.Delete(GuardPath); } catch { }
     }
 }
 
@@ -1064,6 +1146,8 @@ internal sealed class ControlCenterForm : Form
             && CraftySessionLockSelfTest()
             && CraftyDatabaseRecoverySelfTest()
             && CraftyLaunchInfoSelfTest()
+            && ElevationRelaunch.SelfTest()
+            && Updater.SelfTest()
             && StoppingStateSelfTest()
             && providers.Count == 4
             && providers.Values.All(provider => provider.Status != ProviderStatus.Unavailable)
