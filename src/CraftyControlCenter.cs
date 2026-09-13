@@ -101,16 +101,35 @@ internal static class Program
 
 internal static class CraftyTheme
 {
-    internal static readonly Color DeepBackground = Color.FromArgb(28, 30, 47);
-    internal static readonly Color Surface = Color.FromArgb(34, 36, 55);
-    internal static readonly Color RaisedSurface = Color.FromArgb(40, 42, 64);
-    internal static readonly Color DisabledSurface = Color.FromArgb(50, 53, 80);
-    internal static readonly Color Outline = Color.FromArgb(56, 62, 93);
-    internal static readonly Color Text = Color.FromArgb(185, 192, 211);
-    internal static readonly Color MutedText = Color.FromArgb(139, 162, 181);
-    internal static readonly Color Heading = Color.FromArgb(247, 247, 249);
-    internal static readonly Color Primary = Color.FromArgb(33, 150, 243);
-    internal static readonly Color Danger = Color.FromArgb(255, 98, 88);
+    internal static readonly Color DeepBackground = Color.FromArgb(17, 24, 19);
+    internal static readonly Color Surface = Color.FromArgb(27, 38, 30);
+    internal static readonly Color RaisedSurface = Color.FromArgb(37, 52, 40);
+    internal static readonly Color DisabledSurface = Color.FromArgb(50, 64, 52);
+    internal static readonly Color Outline = Color.FromArgb(70, 94, 72);
+    internal static readonly Color Text = Color.FromArgb(211, 224, 207);
+    internal static readonly Color MutedText = Color.FromArgb(156, 179, 150);
+    internal static readonly Color Heading = Color.FromArgb(246, 249, 242);
+    internal static readonly Color Primary = Color.FromArgb(45, 133, 66);
+    internal static readonly Color Danger = Color.FromArgb(174, 72, 39);
+}
+
+internal sealed class BackdropLabel : Label
+{
+    internal BackdropLabel()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.SupportsTransparentBackColor, true);
+        BackColor = Color.Transparent;
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        ControlCenterForm form = Parent as ControlCenterForm;
+        if (form != null)
+            form.PaintBackdropSlice(e.Graphics, Bounds);
+        else
+            e.Graphics.Clear(Parent == null ? CraftyTheme.DeepBackground : Parent.BackColor);
+    }
 }
 
 internal sealed class RoundedPanel : Panel
@@ -128,7 +147,11 @@ internal sealed class RoundedPanel : Panel
     protected override void OnPaintBackground(PaintEventArgs e)
     {
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(Parent == null ? CraftyTheme.DeepBackground : Parent.BackColor);
+        ControlCenterForm form = Parent as ControlCenterForm;
+        if (form != null)
+            form.PaintBackdropSlice(e.Graphics, Bounds);
+        else
+            e.Graphics.Clear(Parent == null ? CraftyTheme.DeepBackground : Parent.BackColor);
         using (GraphicsPath path = CreateRoundedPath(ClientRectangle, CornerRadius))
         using (SolidBrush brush = new SolidBrush(BackColor))
             e.Graphics.FillPath(brush, path);
@@ -187,7 +210,11 @@ internal sealed class RoundedButton : Button
     protected override void OnPaint(PaintEventArgs e)
     {
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(Parent == null ? CraftyTheme.DeepBackground : Parent.BackColor);
+        ControlCenterForm form = Parent as ControlCenterForm;
+        if (form != null)
+            form.PaintBackdropSlice(e.Graphics, Bounds);
+        else
+            e.Graphics.Clear(Parent == null ? CraftyTheme.DeepBackground : Parent.BackColor);
         Rectangle bounds = new Rectangle(0, 0, Math.Max(0, Width - 1), Math.Max(0, Height - 1));
         Color fill = BackColor;
         if (Enabled && pressed)
@@ -864,6 +891,7 @@ internal sealed class ControlCenterForm : Form
     private readonly Dictionary<string, int> waitVersions = new Dictionary<string, int>();
     private readonly object waitSync = new object();
     private readonly System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer();
+    private readonly Image backdropImage;
     private readonly ToolTip toolTip = new ToolTip();
     private readonly List<string> startupWarnings = new List<string>();
     private Dictionary<int, ProcessRecord> cachedProcessTable;
@@ -913,6 +941,9 @@ internal sealed class ControlCenterForm : Form
         BackColor = CraftyTheme.DeepBackground;
         ForeColor = CraftyTheme.Text;
         DoubleBuffered = true;
+        backdropImage = CreateBackdropImage(ClientSize);
+        BackgroundImage = backdropImage;
+        BackgroundImageLayout = ImageLayout.None;
 
         BuildInterface();
         ConfigureProviders();
@@ -946,6 +977,57 @@ internal sealed class ControlCenterForm : Form
             statusTimer.Stop();
             CancelAllWaits();
         };
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && backdropImage != null)
+            backdropImage.Dispose();
+        base.Dispose(disposing);
+    }
+
+    internal void PaintBackdropSlice(Graphics graphics, Rectangle sourceBounds)
+    {
+        if (backdropImage == null)
+        {
+            graphics.Clear(CraftyTheme.DeepBackground);
+            return;
+        }
+        graphics.DrawImage(backdropImage,
+            new Rectangle(0, 0, sourceBounds.Width, sourceBounds.Height),
+            sourceBounds, GraphicsUnit.Pixel);
+    }
+
+    private static Image CreateBackdropImage(Size size)
+    {
+        try
+        {
+            using (Stream stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("MinecraftControlCenter.Background.jpg"))
+            {
+                if (stream == null)
+                    return null;
+                using (Image source = Image.FromStream(stream))
+                {
+                    Bitmap result = new Bitmap(size.Width, size.Height);
+                    using (Graphics graphics = Graphics.FromImage(result))
+                    {
+                        graphics.Clear(CraftyTheme.DeepBackground);
+                        float scale = Math.Max((float)size.Width / source.Width, (float)size.Height / source.Height);
+                        int width = (int)Math.Ceiling(source.Width * scale);
+                        int height = (int)Math.Ceiling(source.Height * scale);
+                        int left = (size.Width - width) / 2;
+                        int top = (size.Height - height) / 2;
+                        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        graphics.DrawImage(source, new Rectangle(left, top, width, height));
+                        using (SolidBrush fade = new SolidBrush(Color.FromArgb(198, CraftyTheme.DeepBackground)))
+                            graphics.FillRectangle(fade, 0, 0, size.Width, size.Height);
+                    }
+                    return result;
+                }
+            }
+        }
+        catch { return null; }
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -1204,7 +1286,7 @@ internal sealed class ControlCenterForm : Form
 
     private static Label NewLabel(string text, Point location, Size size, float fontSize, bool bold, Color color)
     {
-        Label label = new Label();
+        Label label = new BackdropLabel();
         label.Text = text;
         label.Location = location;
         label.Size = size;
