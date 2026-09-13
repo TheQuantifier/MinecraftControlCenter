@@ -132,7 +132,7 @@ jobs:
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
-              --title "Minecraft Control Center $env:RELEASE_TAG" `
+              --title "MCC $env:RELEASE_TAG" `
               --notes-file $notesPath --latest --verify-tag
             if ($LASTEXITCODE -ne 0) { throw 'Updating the GitHub Release failed.' }
 
@@ -144,7 +144,7 @@ jobs:
           }
           else {
             gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY `
-              --title "Minecraft Control Center $env:RELEASE_TAG" `
+              --title "MCC $env:RELEASE_TAG" `
               --notes-file $notesPath --latest --verify-tag
             if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub Release failed.' }
           }
